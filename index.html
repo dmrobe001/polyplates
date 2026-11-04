@@ -99,7 +99,7 @@ select { width: 100%; background: #10161f; color: var(--fg); border: 1px solid v
 
 <aside id="panel">
   <header>
-    <h1>Polyplates<small>v0.4.2</small></h1>
+    <h1>Polyplates<small>v0.4.3</small></h1>
     <button id="collapse" aria-expanded="true" aria-controls="body">hide</button>
   </header>
   <div id="body">
@@ -1360,14 +1360,7 @@ function weldPlates(W) {
   // slab break-off between the two
   for (let k = 0; k < keep.n; k++) if (keep.sub[k] === 1 && ((k < off && keep.under[k] === gone.uid) || (k >= off && keep.under[k] === keep.uid))) keep.sub[k] = 3;
   compactSlab(keep);
-  // suture damage: boundary columns of one part within 1.5 s of the other part's boundary
-  const lim = 1.5 * W.s, h = new SphereHash(lim);
-  for (const v of keep.bvert) if (v >= off) h.insert(keep.pos[3 * v], keep.pos[3 * v + 1], keep.pos[3 * v + 2], v);
-  for (const v of keep.bvert) if (v < off) {
-    let hit = false;
-    h.query(keep.pos[3 * v], keep.pos[3 * v + 1], keep.pos[3 * v + 2], u => { if (Math.hypot(keep.pos[3 * u] - keep.pos[3 * v], keep.pos[3 * u + 1] - keep.pos[3 * v + 1], keep.pos[3 * u + 2] - keep.pos[3 * v + 2]) < lim) { keep.D[u] = 1; hit = true; } });
-    if (hit) keep.D[v] = 1;
-  }
+  retriangulateWeld(W, keep, off, [keep.id, gone.id]);
   // slabs of other plates that were under the absorbed plate are now under the merged one
   for (const pl of W.plates) for (let k = 0; k < pl.n; k++) if (pl.sub[k] === 1 && pl.under[k] === gone.uid) pl.under[k] = keep.uid;
   const len = om.length();
@@ -1376,6 +1369,97 @@ function weldPlates(W) {
   W.welds++;
   return true;
 }
+// Re-triangulate a freshly welded plate (parts: columns < off, columns ≥ off), so the suture has no holes or
+// overlaps:
+//  1. columns of the two parts closer than 0.3 s are merged (V_c summed, intensive state area-weighted);
+//  2. all surface columns get a fresh spherical Delaunay triangulation (two stereographic projections);
+//  3. a triangle is kept if its edges are ≤ seamMax·s and its centroid lies inside the old union of the two
+//     surfaces, or in open space that no other plate covers (the gaps along the suture);
+//  4. within the suture zone (2.5 s of the other part) V_c is conserved, so where the parts overlapped, their
+//     crust stacks into a thickened suture; elsewhere h_c is preserved, so re-meshing adds no noise;
+//  5. columns within 1.5 s of the other part get D = 1 (the suture is a weak zone, §11.4).
+function retriangulateWeld(W, pl, off, skipIds) {
+  const s = W.s, n = pl.n, P3 = pl.pos, R2 = P.R * P.R;
+  const used = new Uint8Array(n); for (let i = 0; i < 3 * pl.nt; i++) used[pl.tri[i]] = 1;
+  const inSlab = new Uint8Array(n); for (let i = 0; i < 3 * pl.snt; i++) inSlab[pl.stri[i]] = 1;
+  const surf = k => used[k] && !pl.sub[k];
+  const hc0 = new Float64Array(n); let V0 = 0;
+  for (let k = 0; k < n; k++) if (surf(k)) { hc0[k] = pl.Vc[k] / pl.A[k]; V0 += pl.Vc[k]; }
+  // old surface triangles, for the "inside the old union" test (body frame)
+  const oldTri = pl.tri.slice(0, 3 * pl.nt), oldHash = new SphereHash(2 * s);
+  for (let t = 0; t < pl.nt; t++) { const a = 3 * oldTri[3 * t], b = 3 * oldTri[3 * t + 1], c = 3 * oldTri[3 * t + 2]; oldHash.insert((P3[a] + P3[b] + P3[c]) / 3, (P3[a + 1] + P3[b + 1] + P3[c + 1]) / 3, (P3[a + 2] + P3[b + 2] + P3[c + 2]) / 3, t); }
+  const inOld = (x, y, z) => { let hit = false; oldHash.query(x, y, z, t => { if (hit) return; const a = 3 * oldTri[3 * t], b = 3 * oldTri[3 * t + 1], c = 3 * oldTri[3 * t + 2];
+    const sd = (u, v) => x * (P3[u + 1] * P3[v + 2] - P3[u + 2] * P3[v + 1]) + y * (P3[u + 2] * P3[v] - P3[u] * P3[v + 2]) + z * (P3[u] * P3[v + 1] - P3[u + 1] * P3[v]);
+    if (sd(a, b) >= 0 && sd(b, c) >= 0 && sd(c, a) >= 0) hit = true; }); return hit; };
+  // suture zone and near-duplicate merging
+  const Z = 2.5 * s, partHash = [new SphereHash(Z), new SphereHash(Z)];
+  for (let k = 0; k < n; k++) if (surf(k)) partHash[k < off ? 0 : 1].insert(P3[3 * k], P3[3 * k + 1], P3[3 * k + 2], k);
+  const zone = new Uint8Array(n), merged = new Uint8Array(n);
+  for (let k = 0; k < n; k++) {
+    if (!surf(k)) continue;
+    let best = -1, bd = Infinity;
+    partHash[k < off ? 1 : 0].query(P3[3 * k], P3[3 * k + 1], P3[3 * k + 2], u => {
+      const d = Math.hypot(P3[3 * u] - P3[3 * k], P3[3 * u + 1] - P3[3 * k + 1], P3[3 * u + 2] - P3[3 * k + 2]);
+      if (d < Z) zone[k] = 1;
+      if (d < 1.5 * s) pl.D[k] = 1;
+      if (d < bd) { bd = d; best = u; }
+    });
+    // merge a column of the absorbed part into a nearly coincident column of the kept part
+    if (k >= off && best >= 0 && bd < 0.3 * s && !inSlab[k] && !merged[best] && !merged[k]) {
+      const u = best, A0 = pl.A[u], A1 = pl.A[k], V0 = pl.Vc[u], V1 = pl.Vc[k];
+      if (V0 + V1 > 0) pl.rhoc[u] = (pl.rhoc[u] * V0 + pl.rhoc[k] * V1) / (V0 + V1);
+      for (const f of ["rhom", "L", "e", "w", "D"]) pl[f][u] = (pl[f][u] * A0 + pl[f][k] * A1) / (A0 + A1);
+      pl.Vc[u] = V0 + V1; pl.Vc[k] = 0; pl.sub[k] = 4; merged[k] = 1; merged[u] = 1;
+    }
+  }
+  // fresh Delaunay triangulation of the surface columns
+  const ids = []; for (let k = 0; k < n; k++) if (surf(k) && !pl.sub[k]) ids.push(k);
+  const m = qmat(pl.q), tris = [], maxL2 = (NUM.seamMax * s) ** 2;
+  const coveredByOther = (x, y, z) => { // x,y,z in body frame
+    const wx = m[0] * x + m[1] * y + m[2] * z, wy = m[3] * x + m[4] * y + m[5] * z, wz = m[6] * x + m[7] * y + m[8] * z, l = Math.hypot(wx, wy, wz);
+    let c = false; W.triHash.queryCell(wx / l, wy / l, wz / l, id => { if (c) return; const p = Math.floor(id / TRI_ID); if (skipIds.includes(p)) return;
+      const t = id - p * TRI_ID, q = W.plates[p], w = q.wpos, a = 3 * q.tri[3 * t], b = 3 * q.tri[3 * t + 1], cc = 3 * q.tri[3 * t + 2], X = wx / l, Y = wy / l, Zz = wz / l;
+      const sd = (u, v) => X * (w[u + 1] * w[v + 2] - w[u + 2] * w[v + 1]) + Y * (w[u + 2] * w[v] - w[u] * w[v + 2]) + Zz * (w[u] * w[v + 1] - w[u + 1] * w[v]);
+      if (sd(a, b) >= 0 && sd(b, cc) >= 0 && sd(cc, a) >= 0) c = true; });
+    return c; };
+  for (const sg of [1, -1]) {
+    const coords = new Float64Array(2 * ids.length);
+    ids.forEach((k, i) => { const f = 1 / Math.max(1e-9, 1 - sg * P3[3 * k + 2]); coords[2 * i] = P3[3 * k] * f; coords[2 * i + 1] = sg * P3[3 * k + 1] * f; });
+    const tr = new Delaunator(coords).triangles;
+    for (let t = 0; t < tr.length; t += 3) {
+      let a = ids[tr[t]], b = ids[tr[t + 1]], c = ids[tr[t + 2]];
+      const cz = P3[3 * a + 2] + P3[3 * b + 2] + P3[3 * c + 2];
+      if (sg > 0 ? cz > 0 : cz <= 0) continue;
+      let long = false;
+      for (const [u, v] of [[a, b], [b, c], [c, a]]) if ((P3[3 * u] - P3[3 * v]) ** 2 + (P3[3 * u + 1] - P3[3 * v + 1]) ** 2 + (P3[3 * u + 2] - P3[3 * v + 2]) ** 2 > maxL2) long = true;
+      if (long) continue;
+      if (orient(P3, a, b, c) < 0) { const tmp = b; b = c; c = tmp; }
+      if (orient(P3, a, b, c) < 1e-3 * s * s) continue;
+      const x = (P3[3 * a] + P3[3 * b] + P3[3 * c]) / 3, y = (P3[3 * a + 1] + P3[3 * b + 1] + P3[3 * c + 1]) / 3, z = (P3[3 * a + 2] + P3[3 * b + 2] + P3[3 * c + 2]) / 3;
+      if (!inOld(x, y, z) && coveredByOther(x, y, z)) continue;
+      tris.push(a, b, c);
+    }
+  }
+  pl.nt = 0; for (let i = 0; i < tris.length; i += 3) addTri(pl, tris[i], tris[i + 1], tris[i + 2]);
+  // surface columns left without a triangle hand their crust to the nearest triangulated column
+  const now = new Uint8Array(n); for (let i = 0; i < 3 * pl.nt; i++) now[pl.tri[i]] = 1;
+  const nh = new SphereHash(2 * s); for (const k of ids) if (now[k]) nh.insert(P3[3 * k], P3[3 * k + 1], P3[3 * k + 2], k);
+  computeAreas(pl);
+  for (const k of ids) {
+    if (now[k]) { if (!zone[k]) pl.Vc[k] = hc0[k] * pl.A[k]; continue; }
+    let best = -1, bd = Infinity;
+    nh.query(P3[3 * k], P3[3 * k + 1], P3[3 * k + 2], u => { const d = (P3[3 * u] - P3[3 * k]) ** 2 + (P3[3 * u + 1] - P3[3 * k + 1]) ** 2 + (P3[3 * u + 2] - P3[3 * k + 2]) ** 2; if (d < bd) { bd = d; best = u; } });
+    if (best >= 0) addCrust(pl, best, pl.Vc[k], pl.rhoc[k]);
+    pl.Vc[k] = 0; pl.sub[k] = 4;
+  }
+  // holding h_c fixed outside the suture zone is not exactly conservative: rescale those columns so the
+  // plate's total crustal volume is unchanged
+  let Vz = 0, Vo = 0;
+  for (let k = 0; k < n; k++) if (!pl.sub[k] && now[k]) { if (zone[k]) Vz += pl.Vc[k]; else Vo += pl.Vc[k]; }
+  if (Vo > 0) { const f = (V0 - Vz) / Vo; for (let k = 0; k < n; k++) if (!pl.sub[k] && now[k] && !zone[k]) pl.Vc[k] *= f; }
+  extractBoundary(pl); pl.version++;
+}
+
 // remove plates with no surface left, and keep ids equal to array positions
 function tidyPlates(W) {
   const before = W.plates.length;

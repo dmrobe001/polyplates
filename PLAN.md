@@ -96,6 +96,15 @@ which also drew slabs on the far side of the globe through the planet. Those far
 "slab patches in plate interiors" first reported. The overlay now discards fragments on the hemisphere
 facing away from the camera. (The v0.4.1 polarity and slab fixes were real problems, but not this one.)
 
+Fixed in v0.4.3: welding stacked the two meshes without stitching them, leaving holes along the suture and
+overlaps where the parts had interpenetrated (up to 75 folded boundary vertices and 13 boundary loops on one
+merged plate). A welded plate is now re-triangulated: columns of the two parts within 0.3 s are merged; all
+surface columns get a fresh spherical Delaunay triangulation, keeping short triangles inside the old union or
+in open space no other plate covers; within 2.5 s of the suture V_c is conserved (so overlapped crust stacks
+into a thickened suture), elsewhere h_c is preserved and then rescaled so the plate's total crust is exactly
+unchanged; columns within 1.5 s of the other part get D = 1. Every merged plate tested has one boundary loop,
+no folds, no duplicate or inverted triangles.
+
 Added outside the spec (to revisit):
 - **Crustal flow as a stand-in for gravitational collapse.** Without deformable plates, collision and arc
   growth thickened single columns without limit (196 km crust and 24 km elevations in testing). Crust
