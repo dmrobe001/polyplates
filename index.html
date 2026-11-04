@@ -99,7 +99,7 @@ select { width: 100%; background: #10161f; color: var(--fg); border: 1px solid v
 
 <aside id="panel">
   <header>
-    <h1>Polyplates<small>v0.4.3</small></h1>
+    <h1>Polyplates<small>v0.5</small></h1>
     <button id="collapse" aria-expanded="true" aria-controls="body">hide</button>
   </header>
   <div id="body">
@@ -114,6 +114,8 @@ select { width: 100%; background: #10161f; color: var(--fg); border: 1px solid v
       <div><span>crack fills</span><b id="r-fills">–</b></div>
       <div><span>slab columns</span><b id="r-slab">–</b></div>
       <div><span>welds</span><b id="r-welds">–</b></div>
+      <div><span>rms plate speed</span><b id="r-speed">–</b></div>
+      <div><span>fastest plate</span><b id="r-vmax">–</b></div>
     </div>
 
     <div class="mixbox">
@@ -155,6 +157,11 @@ select { width: 100%; background: #10161f; color: var(--fg); border: 1px solid v
         <label for="np">Initial plates</label><output id="np-out" for="np"></output>
         <input id="np" type="range" min="2" max="30" value="12">
       </div>
+      <div class="ctl">
+        <label for="spin">Kinematic spin-up</label><output id="spin-out" for="spin"></output>
+        <input id="spin" type="range" min="0" max="60" value="20">
+        <span class="note">prescribed motions at first, blended into the torque balance; grows the first slabs</span>
+      </div>
       <div class="row">
         <input id="seed" type="number" value="1" aria-label="Random seed">
         <button id="dice" title="New random seed">new seed</button>
@@ -168,6 +175,7 @@ select { width: 100%; background: #10161f; color: var(--fg); border: 1px solid v
         <option value="plate">Plate</option>
         <option value="L">Plate thickness L</option>
         <option value="hc">Crustal thickness h_c</option>
+        <option value="D">Damage D</option>
         <option value="mesh">Mesh (plates and seams)</option>
       </select>
       <div id="legend"><canvas id="legend-bar" width="256" height="10"></canvas><div class="ticks" id="legend-ticks"></div></div>
@@ -175,17 +183,21 @@ select { width: 100%; background: #10161f; color: var(--fg); border: 1px solid v
         <span class="seamsw"></span> seam faces belong to no plate and are rebuilt each step.</p>
       <label class="check"><input id="bounds" type="checkbox" checked> Boundaries coloured by type</label>
       <label class="check"><input id="slabs" type="checkbox" checked> Slabs (drawn through the overriding plate)</label>
+      <label class="check"><input id="arrows" type="checkbox" checked> Plate velocity arrows</label>
     </fieldset>
 
     <div class="status">
-      <b>Simulated now:</b> separate plate meshes on prescribed rigid rotations; per-column state;
+      <b>Simulated now:</b> separate rigid plate meshes whose rotations are solved every step from a torque balance
+      (milestone 3): slab pull, ridge push through gravitational potential energy, basal and slab drag, friction on
+      subduction interfaces and transforms, trench suction. Boundary slip damages the boundary columns, which weakens
+      them. Per-column state;
       isostatic elevation; conductive thickening of L. Boundaries are classified each step from the signed gap
       and relative velocity. Gaps between plates are covered by seam faces rebuilt every step; when a seam
       grows wider than about one vertex spacing, both plates grow to its midline as new sea floor. Cracks within a
       single plate are filled outright. <span class="gap">Orange</span> is open mantle that nothing covers yet.
       Where plates overlap, the denser column subducts and is kept as slab (red overlay) until it is
       933 km down-dip from the trench (drawn foreshortened to its 45° map footprint, fading with depth); buoyant columns that collide hand their crust to the overriding plate, and plates
-      that keep colliding weld into one. Motions are still prescribed.
+      that keep colliding weld into one. Arrows show plate velocity (5 cm/yr ≈ 280 km of arrow).
     </div>
   </div>
 </aside>
@@ -196,7 +208,7 @@ select { width: 100%; background: #10161f; color: var(--fg); border: 1px solid v
 <script>
 "use strict";
 /* ======================================================================
-   Polyplates v0.2 — kinematic plates with contact geometry and spreading.
+   Polyplates v0.5 — rigid plates driven by a torque balance, with contact geometry, spreading, subduction and welding.
    Section numbers (§) refer to the model description (docs/lithosphere_plate_model.tex).
    Lengths on the unit sphere are written in units of the mean vertex spacing s.
    ====================================================================== */
@@ -223,6 +235,19 @@ const P = {
   // Stand-in for gravitational collapse until deformable plates (milestone 6): crust thicker than h_flow
   // diffuses to neighbouring columns of the same plate, volume conserved, at a rate rising with the excess.
   h_flow: 45e3, tau_flow: 5 * MYR,
+  // Milestone 3: forces (§6–7, §11.5, §12–14)
+  g: 9.81,
+  w_o: 0.7,                           // hydration of new plate (spec: 0, status P; see PLAN.md, v0.5)
+  mu_f: 0.6, lam0: 0.37, lam1: 0.9,   // friction coefficient; pore-pressure ratio dry / fully hydrated
+  n_cr: 3.5, Rg: 8.314, dTw: 150, sig_max: 800e6, kap_sig: 0.5,
+  a_b: 0.7, a_d: 0.9,                 // frictional / creep weakening at full damage
+  k_D: 10, tau_h0: 100 * MYR, T_h0: 400, Q_h: 300e3, zeta_h: 15e3, ell_D: 15e3, // §10 damage
+  rho_ecl: 3500, e_sp: 0.2, z_int: 40e3, xi_s: 0.1,
+  eta_a: 1e20, h_a: 100e3, L_ref: 100e3, m_b: 1,
+  v_reg: 1e-4 / YR,                   // friction regularisation speed (0.1 mm/yr)
+  c_slab: 2,                          // slab columns also feel viscous drag, c_slab × C_b (both faces; not in spec)
+  k_coll: 3e21,                       // resistance to convergence of two buoyant columns in contact (N s/m³; not in spec)
+  t_spin: 20,                         // Myr of prescribed motion, blended into the force balance (not in spec)
 };
 // Numerical parameters (status N), as multiples of the mean spacing s
 const NUM = {
@@ -279,7 +304,10 @@ class Heap {
 // ---------- §5–6: density, isostasy ----------
 function layerMass(r0, a, b, G) { return r0 * ((b - a) * (1 - P.alpha * (P.Ts - P.T0)) - P.alpha * G * (b * b - a * a) / 2); }
 function asthMass(a) { return P.rho_a0 * ((P.zc - a) * (1 - P.alpha * (P.Tp - P.T0)) - P.alpha * P.gad * (P.zc * P.zc - a * a) / 2); }
+// The plate is never thinner than its crust: new plate has L_0 = 5 km < h_c^o = 7 km, which would otherwise make
+// crust and asthenosphere overlap in the integrals below (see PLAN.md, notes on the spec).
 function columnMass(e, hc, rc, rm, L) {
+  L = Math.max(L, hc);
   const G = (P.TL - P.Ts) / L;
   return P.rho_w * Math.max(-e, 0) + layerMass(rc, 0, hc, G) + layerMass(rm, hc, L, G) + asthMass(L - e);
 }
@@ -295,10 +323,70 @@ function isostaticElevation(e, hc, rc, rm, L, iters) {
 }
 // Eq. buoyancy: net buoyancy per unit area relative to asthenosphere at the same depth below the surface
 function buoyancy(hc, rc, rm, L) {
+  L = Math.max(L, hc);
   const G = (P.TL - P.Ts) / L;
   return P.rho_a0 * (L * (1 - P.alpha * (P.Tp - P.T0)) - P.alpha * P.gad * L * L / 2) - layerMass(rc, 0, hc, G) - layerMass(rm, hc, L, G);
 }
 const colB = (pl, k) => buoyancy(pl.Vc[k] / pl.A[k], pl.rhoc[k], pl.rhom[k], pl.L[k]);
+// Eq. GPE: Γ = ∫ P dz from the top of the column to z_c = g ∫ ρ(z)(z_c − z) dz (by parts). Density is linear in z
+// within each layer, so Simpson's rule is exact. Returned relative to the reference (new ridge) column, so Γ_0 = 0.
+function gpeAbs(e, hc, rc, rm, L) {
+  L = Math.max(L, hc);
+  const G = (P.TL - P.Ts) / L, zc = P.zc, top = -e;
+  let I = 0;
+  const seg = (z0, z1, r0, r1) => { if (z1 > z0) I += (z1 - z0) / 6 * (r0 * (zc - z0) + 2 * (r0 + r1) * (zc - (z0 + z1) / 2) + r1 * (zc - z1)); };
+  const rT = (r, zeta) => r * (1 - P.alpha * (P.Ts + G * zeta - P.T0)), ra = z => P.rho_a0 * (1 - P.alpha * (P.Tp + P.gad * z - P.T0));
+  if (e < 0) seg(0, -e, P.rho_w, P.rho_w);
+  seg(top, top + hc, rT(rc, 0), rT(rc, hc));
+  seg(top + hc, top + L, rT(rm, hc), rT(rm, L));
+  seg(top + L, zc, ra(top + L), ra(zc));
+  return P.g * I;
+}
+const GAMMA_REF = gpeAbs(P.e_ref, P.hc_o, P.rhoc_o, P.rhom_o, P.L0);
+const colGamma = (pl, k) => gpeAbs(pl.e[k], pl.Vc[k] / pl.A[k], pl.rhoc[k], pl.rhom[k], pl.L[k]) - GAMMA_REF;
+
+// ---------- §7–9 strength profile and yield resultant (the part milestone 3 needs; milestone 4 completes it) ----------
+const ANCH = [[2700, 300, 223e3], [2950, 600, 485e3], [3250, 750, 530e3]]; // ρ0, T_bd (°C), Q (J/mol)
+function anchor(r0, j) {
+  if (r0 <= ANCH[0][0]) return ANCH[0][j];
+  for (let i = 1; i < ANCH.length; i++) if (r0 <= ANCH[i][0]) { const t = (r0 - ANCH[i - 1][0]) / (ANCH[i][0] - ANCH[i - 1][0]); return ANCH[i - 1][j] + t * (ANCH[i][j] - ANCH[i - 1][j]); }
+  return ANCH[ANCH.length - 1][j];
+}
+const MU_R = (Math.sqrt(1 + P.mu_f * P.mu_f) + P.mu_f) ** 2, BETA_C = MU_R - 1, BETA_S = 2 * (MU_R - 1) / (MU_R + 1), BETA_E = 1 - 1 / MU_R;
+// lithostatic pressure at depth ζ below the solid surface (water load + layers at temperature)
+function pressureBelow(zeta, e, hc, rc, rm, G) {
+  let p = P.rho_w * P.g * Math.max(-e, 0) + P.g * layerMass(rc, 0, Math.min(zeta, hc), G);
+  if (zeta > hc) p += P.g * layerMass(rm, hc, zeta, G);
+  return p;
+}
+// Eq. resultants: F_b(χ), the depth-integrated frictional/plastic strength, by midpoint quadrature (Eq. envelope)
+function yieldResultant(e, hc, rc, rm, L, w, D, chi) {
+  L = Math.max(L, hc);
+  const G = (P.TL - P.Ts) / L, lam = P.lam0 + (P.lam1 - P.lam0) * w;
+  const beta = chi < 0 ? BETA_S + (BETA_S - BETA_C) * chi : BETA_S + (BETA_E - BETA_S) * chi;
+  const kb = 1 - P.a_b * D, kd = 1 - P.a_d * D;
+  const lay = [rc, rm].map(r0 => {
+    const Tbd = anchor(r0, 1) - P.dTw * w, zbd = (Tbd - P.Ts) / G;
+    return { Tbd: Tbd + 273.15, Qn: anchor(r0, 2) / (P.n_cr * P.Rg), s0: BETA_C * (1 - P.lam0) * pressureBelow(zbd, e, hc, rc, rm, G) };
+  });
+  const nq = 32, dz = L / nq; let Fb = 0;
+  for (let i = 0; i < nq; i++) {
+    const z = (i + 0.5) * dz, l = lay[z < hc ? 0 : 1], T = P.Ts + G * z + 273.15;
+    const sb = kb * Math.min(beta * (1 - lam) * pressureBelow(z, e, hc, rc, rm, G), P.sig_max);
+    const sd = kd * l.s0 * Math.exp(l.Qn * (1 / T - 1 / l.Tbd));
+    if (sb <= sd) Fb += sb * dz;
+  }
+  return P.kap_sig * Fb;
+}
+const colFb = (pl, k, chi) => yieldResultant(pl.e[k], pl.Vc[k] / pl.A[k], pl.rhoc[k], pl.rhom[k], pl.L[k], pl.w[k], pl.D[k], chi);
+// ∫_0^z P_s dζ (interface friction), Simpson on 8 intervals
+function pressureIntegral(z, e, hc, rc, rm, L) {
+  L = Math.max(L, hc);
+  const G = (P.TL - P.Ts) / L; let I = 0;
+  for (let i = 0; i <= 8; i++) I += (i === 0 || i === 8 ? 1 : i % 2 ? 4 : 2) * pressureBelow(z * i / 8, e, hc, rc, rm, G);
+  return I * z / 24;
+}
+
 function Lmax(rm) {
   const s = Math.min(Math.max((P.rho_a0 - rm) / (P.rho_a0 - P.rho_dep), 0), 1);
   return P.Lmax_o + (P.Lmax_cr - P.Lmax_o) * s;
@@ -435,8 +523,10 @@ const F64 = ["A", "Vc", "rhoc", "rhom", "L", "e"], F32 = ["w", "D"], V3 = ["pos"
 // sub: 0 surface column, 1 slab (subducted, frozen), 2 consumed in a collision, 3 slab deleted, 4 orphaned
 // tri holds surface triangles only; stri holds slab triangles (kept for display)
 let PLATE_UID = 0;
-function newPlate(id, axis, omega, hue) {
-  return { id, uid: PLATE_UID++, axis, omega, hue, q: new THREE.Quaternion(), n: 0, cap: 0, nt: 0, tcap: 0, tri: new Uint32Array(0),
+// om: angular velocity (world frame, rad/s) used to move the plate; omKin: prescribed (spin-up) value;
+// omDyn: torque-balance solution (§14 rigid limit)
+function newPlate(id, omKin, hue) {
+  return { id, uid: PLATE_UID++, om: omKin.slice(), omKin: omKin.slice(), omDyn: [0, 0, 0], hue, q: new THREE.Quaternion(), n: 0, cap: 0, nt: 0, tcap: 0, tri: new Uint32Array(0),
            snt: 0, stri: new Uint32Array(0), version: 0 };
 }
 function growPlate(pl, need) {
@@ -491,7 +581,7 @@ function extractBoundary(pl) {
   pl.bvert = Uint32Array.from(bv);
   const nb = bv.length;
   pl.bgap = new Float64Array(nb); pl.bvn = new Float64Array(nb); pl.bvt = new Float64Array(nb);
-  pl.bcls = new Uint8Array(nb); pl.bn = new Float64Array(3 * nb); pl.bq = new Int16Array(nb); pl.bmate = new Float64Array(3 * nb).fill(NaN);
+  pl.bcls = new Uint8Array(nb); pl.bn = new Float64Array(3 * nb); pl.bq = new Int16Array(nb); pl.bqv = new Int32Array(nb).fill(-1); pl.bmate = new Float64Array(3 * nb).fill(NaN);
   // ordered boundary loops (edge walk; at a pinch vertex take any unused outgoing edge)
   const nbe = be.length / 2, outStart = new Int32Array(nb + 1), outList = new Int32Array(nbe);
   for (let e = 0; e < nbe; e++) outStart[pl.bidx[be[2 * e]] + 1]++;
@@ -529,7 +619,7 @@ function addNewFloor(pl, k, dA) {
   pl.rhom[k] = pl.rhom[k] * f0 + P.rhom_o * f1;
   pl.L[k] = pl.L[k] * f0 + P.L0 * f1;
   pl.e[k] = pl.e[k] * f0 + P.e_ref * f1;
-  pl.w[k] *= f0; pl.D[k] *= f0;
+  pl.w[k] = pl.w[k] * f0 + P.w_o * f1; pl.D[k] *= f0;
   pl.T[3 * k] *= f0; pl.T[3 * k + 1] *= f0; pl.T[3 * k + 2] *= f0;
   pl.A[k] = A1; pl.Vc[k] = V1;
 }
@@ -546,16 +636,22 @@ function makeWorld(opts) {
   const plates = [];
   for (let p = 0; p < nP; p++) {
     const ax = new THREE.Vector3(gauss(rng), gauss(rng), gauss(rng)).normalize();
-    const v = (1 + 6 * rng()) * 0.01 / YR; // surface speed at the Euler equator, 1–7 cm/yr
-    plates.push(newPlate(p, ax, v / P.R, (p * 0.618034) % 1));
+    const v = (1 + 6 * rng()) * 0.01 / YR / P.R; // surface speed at the Euler equator, 1–7 cm/yr
+    plates.push(newPlate(p, [ax.x * v, ax.y * v, ax.z * v], (p * 0.618034) % 1));
   }
 
-  // continents
+  // continents: grown only on vertices at least d_margin inside a single plate, so no continent straddles a
+  // plate boundary at t = 0 (otherwise those plates collide and weld within the first few Myr)
   const isCont = new Uint8Array(N);
   if (opts.contFrac > 0) {
+    const vPlate = new Int32Array(N).fill(-1), edgeV = [];
+    for (let t = 0; t < nt; t++) for (let e = 0; e < 3; e++) { const v = tris[3 * t + e]; if (vPlate[v] === -1) vPlate[v] = triPlate[t]; else if (vPlate[v] !== triPlate[t]) vPlate[v] = -2; }
+    for (let v = 0; v < N; v++) if (vPlate[v] === -2) edgeV.push(v);
+    const dEdge = graphDistance(S, edgeV), margin = Math.max(1.5 * S.s * P.R, 150e3);
+    const ok = v => dEdge[v] >= margin, eligible = []; for (let v = 0; v < N; v++) if (ok(v)) eligible.push(v);
     const nC = 2 + Math.floor(rng() * 5), cs = [], cw = [];
-    for (let i = 0; i < nC; i++) { cs.push((rng() * N) | 0); cw.push(Math.exp(0.7 * gauss(rng))); }
-    const own = growRegions(N, (v, cb) => { for (let j = off[v]; j < off[v + 1]; j++) cb(nb[j]); }, cs, cw, rng, Math.round(opts.contFrac * N));
+    for (let i = 0; i < nC && eligible.length; i++) { cs.push(eligible[(rng() * eligible.length) | 0]); cw.push(Math.exp(0.7 * gauss(rng))); }
+    const own = growRegions(N, (v, cb) => { for (let j = off[v]; j < off[v + 1]; j++) if (ok(nb[j])) cb(nb[j]); }, cs, cw, rng, Math.round(opts.contFrac * N));
     for (let i = 0; i < N; i++) isCont[i] = own[i] >= 0 ? 1 : 0;
   }
 
@@ -566,8 +662,8 @@ function makeWorld(opts) {
     const p = triPlate[t], q = triPlate[u]; if (p === q) continue;
     const A = new THREE.Vector3(c(t, 0), c(t, 1), c(t, 2)), B = new THREE.Vector3(c(u, 0), c(u, 1), c(u, 2));
     const n = B.clone().sub(A).normalize(), m = A.clone().add(B).normalize();
-    const du = new THREE.Vector3().crossVectors(plates[p].axis, m).multiplyScalar(plates[p].omega)
-      .sub(new THREE.Vector3().crossVectors(plates[q].axis, m).multiplyScalar(plates[q].omega));
+    const op = plates[p].omKin, oq = plates[q].omKin;
+    const du = new THREE.Vector3().crossVectors(new THREE.Vector3(op[0] - oq[0], op[1] - oq[1], op[2] - oq[2]), m);
     if (du.dot(n) * P.R < -0.3 * 0.01 / YR) ridge.push(tris[3 * t + e], tris[3 * t + (e + 1) % 3]);
   }
   const dRidge = ridge.length ? graphDistance(S, ridge) : new Float64Array(N).fill(3000e3);
@@ -575,7 +671,7 @@ function makeWorld(opts) {
   const dCoast = coast.length ? graphDistance(S, coast) : new Float64Array(N).fill(2000e3);
   const nz = smoothNoise(S, rng, Math.max(4, Math.round(Math.sqrt(N) / 12)));
 
-  const g = { hc: new Float64Array(N), rhoc: new Float64Array(N), rhom: new Float64Array(N), L: new Float64Array(N) };
+  const g = { hc: new Float64Array(N), rhoc: new Float64Array(N), rhom: new Float64Array(N), L: new Float64Array(N), w: new Float64Array(N) };
   const halfRate = 0.03 / YR;
   for (let i = 0; i < N; i++) {
     if (isCont[i]) {
@@ -585,7 +681,7 @@ function makeWorld(opts) {
       g.L[i] = Math.min(Lmax(g.rhom[i]), 90e3 + 80e3 * s + 15e3 * nz[i]);
     } else {
       const age = Math.max(0, dRidge[i] / halfRate * (0.85 + 0.15 * nz[i]));
-      g.hc[i] = P.hc_o; g.rhoc[i] = P.rhoc_o; g.rhom[i] = P.rhom_o;
+      g.hc[i] = P.hc_o; g.rhoc[i] = P.rhoc_o; g.rhom[i] = P.rhom_o; g.w[i] = P.w_o;
       g.L[i] = Math.min(P.Lmax_o, Math.max(P.L0, P.aL * Math.sqrt(P.kappa * age)));
     }
   }
@@ -601,7 +697,7 @@ function makeWorld(opts) {
     computeAreas(pl);
     for (let k = 0; k < pl.n; k++) {
       const v = src[k];
-      pl.rhoc[k] = g.rhoc[v]; pl.rhom[k] = g.rhom[v]; pl.L[k] = g.L[v]; pl.Vc[k] = g.hc[v] * pl.A[k];
+      pl.rhoc[k] = g.rhoc[v]; pl.rhom[k] = g.rhom[v]; pl.L[k] = g.L[v]; pl.Vc[k] = g.hc[v] * pl.A[k]; pl.w[k] = g.w[v];
       pl.e[k] = isostaticElevation(0, g.hc[v], pl.rhoc[k], pl.rhom[k], pl.L[k], 30);
     }
     extractBoundary(pl);
@@ -609,7 +705,7 @@ function makeWorld(opts) {
   // coverage probes: a fixed set of points in the world frame
   const np = Math.min(8000, N), probes = new Float64Array(3 * np), ga = Math.PI * (3 - Math.sqrt(5));
   for (let i = 0; i < np; i++) { const z = 1 - (2 * i + 1) / np, r = Math.sqrt(1 - z * z); probes[3 * i] = r * Math.cos(i * ga); probes[3 * i + 1] = r * Math.sin(i * ga); probes[3 * i + 2] = z; }
-  const W = { s: S.s, plates, time: 0, probes, coverage: { gap: 0, over: 0, seam: 0 }, blen: new Float64Array(6), events: 0, fills: 0, subducted: 0, consumed: 0, welds: 0, slabDeleted: 0, breakoff: 0, collide: new Map(), topo: 0 };
+  const W = { s: S.s, plates, time: 0, tSpin: opts.tSpin ?? P.t_spin, forces: null, probes, coverage: { gap: 0, over: 0, seam: 0 }, blen: new Float64Array(6), events: 0, fills: 0, subducted: 0, consumed: 0, welds: 0, slabDeleted: 0, breakoff: 0, collide: new Map(), topo: 0 };
   for (const pl of plates) worldPositions(pl);
   contactGeometry(W);
   buildSeams(W);
@@ -652,7 +748,7 @@ function contactGeometry(W) {
   const triHash = triangleHash(W);
   W.triHash = triHash;
   W.seg = { hash, segP, segV, segX };
-  const omegaVec = plates.map(pl => [pl.axis.x * pl.omega * P.R, pl.axis.y * pl.omega * P.R, pl.axis.z * pl.omega * P.R]);
+  const omegaVec = plates.map(pl => [pl.om[0] * P.R, pl.om[1] * P.R, pl.om[2] * P.R]);
   for (const pl of plates) {
     const w = pl.wpos, be = pl.bedge, bn = pl.bn, nb = pl.bvert.length;
     bn.fill(0);
@@ -707,6 +803,7 @@ function contactGeometry(W) {
         vn = dux * nx + duy * ny + duz * nz;                                   // >0: converging
         vt = dux * (y * nz - z * ny) + duy * (z * nx - x * nz) + duz * (x * ny - y * nx);
         pl.bmate[3 * i] = px; pl.bmate[3 * i + 1] = py; pl.bmate[3 * i + 2] = pz;
+        pl.bqv[i] = segV[2 * bj + (bt < 0.5 ? 0 : 1)];                        // facing column on plate q
         // a facing plate exists: the boundary is named by its relative motion; "open gap" is reserved
         // for boundary with no facing plate within reach
         if (segT[bj] && g < 2 * s) cls = CLS.TRENCH;            // overriding side of a subduction zone
@@ -714,7 +811,7 @@ function contactGeometry(W) {
         else if (Math.abs(vt) > Math.abs(vn)) cls = CLS.TRANS;
         else cls = vn > 0 ? CLS.CONV : CLS.DIV;
       }
-      if (bj < 0) { pl.bmate[3 * i] = NaN; }
+      if (bj < 0) { pl.bmate[3 * i] = NaN; pl.bqv[i] = -1; }
       if (onTrench[i]) cls = CLS.TRENCH;                          // subducting side: edge of a retained slab
       pl.bgap[i] = g; pl.bvn[i] = vn; pl.bvt[i] = vt; pl.bcls[i] = cls; pl.bq[i] = q;
     }
@@ -1343,7 +1440,8 @@ function weldPlates(W) {
   const area = pl => { let A = 0; for (let k = 0; k < pl.n; k++) if (!pl.sub[k]) A += pl.A[k]; return A; };
   const [keep, gone] = area(pa) >= area(pb) ? [pa, pb] : [pb, pa];
   const Ak = area(keep), Ag = area(gone);
-  const om = keep.axis.clone().multiplyScalar(keep.omega * Ak).add(gone.axis.clone().multiplyScalar(gone.omega * Ag)).divideScalar(Ak + Ag);
+  const wavg = (a, b) => a.map((x, c) => (x * Ak + b[c] * Ag) / (Ak + Ag));
+  const om = wavg(keep.om, gone.om), omKin = wavg(keep.omKin, gone.omKin), omDyn = wavg(keep.omDyn, gone.omDyn);
   // move the absorbed plate's columns into the kept plate's body frame
   const mk = qmat(keep.q), mg = qmat(gone.q), off = keep.n;
   growPlate(keep, keep.n + gone.n);
@@ -1363,8 +1461,7 @@ function weldPlates(W) {
   retriangulateWeld(W, keep, off, [keep.id, gone.id]);
   // slabs of other plates that were under the absorbed plate are now under the merged one
   for (const pl of W.plates) for (let k = 0; k < pl.n; k++) if (pl.sub[k] === 1 && pl.under[k] === gone.uid) pl.under[k] = keep.uid;
-  const len = om.length();
-  keep.axis = len > 0 ? om.normalize() : keep.axis; keep.omega = len;
+  keep.om = om; keep.omKin = omKin; keep.omDyn = omDyn;
   W.plates.splice(W.plates.indexOf(gone), 1);
   W.welds++;
   return true;
@@ -1497,14 +1594,215 @@ function measureCoverage(W) {
   W.coverage.gap = gap / np; W.coverage.over = over / np; W.coverage.seam = seam / np;
 }
 
+// ---------- §12, §14 rigid-plate torque balance (milestone 3) ----------
+// Unknowns: one angular velocity ω_p per plate. Each plate's torque balance (Eq. torque) is
+//   (K_drag,p + Σ friction/contact elements) ω = τ_GPE + τ_slab pull + τ_suction,
+// with basal drag (Eq. drag, mantle at rest: u^m = 0) giving K_drag,p = Σ_v C_b A_v R² (I − x̂x̂ᵀ).
+// Friction (interface, transform/contact) is Coulomb: a force of fixed magnitude F opposing the slip Δu. It is
+// linearised as F/√(|Δu|² + v_reg²) per unit slip and re-solved from the previous iterate (iteratively reweighted
+// least squares, which converges because the dissipation is convex). Elements between plates p and q add
+// +M to the pp and qq blocks and −M to pq and qp, so action equals reaction.
+function solveLinear(A, b, n) { // dense Gaussian elimination with partial pivoting; A, b overwritten
+  for (let c = 0; c < n; c++) {
+    let pr = c, pv = Math.abs(A[c * n + c]);
+    for (let r = c + 1; r < n; r++) { const v = Math.abs(A[r * n + c]); if (v > pv) { pv = v; pr = r; } }
+    if (pv === 0) continue;
+    if (pr !== c) { for (let k = 0; k < n; k++) { const t = A[c * n + k]; A[c * n + k] = A[pr * n + k]; A[pr * n + k] = t; } const t = b[c]; b[c] = b[pr]; b[pr] = t; }
+    const d = A[c * n + c];
+    for (let r = c + 1; r < n; r++) { const f = A[r * n + c] / d; if (!f) continue; for (let k = c; k < n; k++) A[r * n + k] -= f * A[c * n + k]; b[r] -= f * b[c]; }
+  }
+  const x = new Float64Array(n);
+  for (let r = n - 1; r >= 0; r--) { let v = b[r]; for (let k = r + 1; k < n; k++) v -= A[r * n + k] * x[k]; x[r] = A[r * n + r] ? v / A[r * n + r] : 0; }
+  return x;
+}
+function solveTorques(W) {
+  const plates = W.plates, nP = plates.length, n3 = 3 * nP, R = P.R, R2 = R * R, cc = 0.5 * W.s;
+  const uidIx = new Map(plates.map((pl, i) => [pl.uid, i]));
+  const K0 = new Float64Array(n3 * n3), tau = new Float64Array(n3), elems = [];
+  const F = { gpe: new Float64Array(nP), slab: 0, suction: 0, interface: 0, transform: 0, collision: 0 };
+  const sinT = Math.sin(P.theta_d), cosT = Math.cos(P.theta_d), dInt = Math.max(P.z_int / Math.tan(P.theta_d), 1.5 * W.s * R);
+  plates.forEach((pl, p) => {
+    const w = pl.wpos, nb = pl.bvert.length, o = 3 * p;
+    // basal drag
+    let k00 = 0, k01 = 0, k02 = 0, k11 = 0, k12 = 0, k22 = 0;
+    const As = new Float64Array(pl.n); // slab-column areas (pl.A counts surface triangles only)
+    for (let t = 0; t < pl.snt; t++) { const a = pl.stri[3 * t], b2 = pl.stri[3 * t + 1], c = pl.stri[3 * t + 2], ar = triArea(pl.pos, a, b2, c) * R2 / 3; As[a] += ar; As[b2] += ar; As[c] += ar; }
+    for (let v = 0; v < pl.n; v++) {
+      if (pl.sub[v] > 1) continue;
+      const area = pl.sub[v] ? P.c_slab * As[v] : pl.A[v]; if (!area) continue;
+      const c = P.eta_a / P.h_a * Math.pow(pl.L[v] / P.L_ref, P.m_b) * area * R2, x = w[3 * v], y = w[3 * v + 1], z = w[3 * v + 2];
+      k00 += c * (1 - x * x); k11 += c * (1 - y * y); k22 += c * (1 - z * z); k01 -= c * x * y; k02 -= c * x * z; k12 -= c * y * z;
+    }
+    const blk = [k00, k01, k02, k01, k11, k12, k02, k12, k22];
+    for (let r = 0; r < 3; r++) for (let c = 0; c < 3; c++) K0[(o + r) * n3 + o + c] += blk[3 * r + c];
+    // boundary length per boundary vertex, and which vertices are the subducting side of a trench
+    const dl = new Float64Array(nb), isTr = new Uint8Array(nb), be = pl.bedge;
+    for (let i = 0; i < be.length; i += 2) {
+      const a = be[i], b2 = be[i + 1], l = R * Math.hypot(w[3 * b2] - w[3 * a], w[3 * b2 + 1] - w[3 * a + 1], w[3 * b2 + 2] - w[3 * a + 2]);
+      dl[pl.bidx[a]] += l / 2; dl[pl.bidx[b2]] += l / 2;
+      if (pl.etrench[i / 2]) { isTr[pl.bidx[a]] = 1; isTr[pl.bidx[b2]] = 1; }
+    }
+    // Γ_out (Eq. bc): the facing column's GPE at contacts and trenches, Γ_0 = 0 at gaps and spreading seams
+    const gOut = new Float64Array(nb);
+    for (let i = 0; i < nb; i++) {
+      const q = pl.bq[i], qv = pl.bqv[i], cls = pl.bcls[i];
+      const contact = q >= 0 && q !== p && qv >= 0 && q < nP && (pl.bgap[i] < cc || cls === CLS.TRENCH);
+      if (!contact) continue;
+      const pq = plates[q];
+      gOut[i] = colGamma(pq, qv);
+      if (cls === CLS.TRENCH || isTr[i]) continue;
+      // contact friction: strike-slip yield resultant of the weaker column (§11.5), resisting tangential slip;
+      // counted from both sides, so each side contributes half
+      const v = pl.bvert[i], x = [w[3 * v], w[3 * v + 1], w[3 * v + 2]], n = [pl.bn[3 * i], pl.bn[3 * i + 1], pl.bn[3 * i + 2]];
+      const FT = Math.min(colFb(pl, v, 0), colFb(pq, qv, 0));
+      elems.push({ kind: 1, p, q, x, a: n, F: 0.5 * FT * dl[i], tag: "transform" });
+      // two buoyant columns cannot subduct: resist their convergence (stand-in for the contact normal force)
+      if (colB(pl, v) >= P.B_crit && colB(pq, qv) >= P.B_crit) {
+        const t = [x[1] * n[2] - x[2] * n[1], x[2] * n[0] - x[0] * n[2], x[0] * n[1] - x[1] * n[0]];
+        elems.push({ kind: 2, p, q, x, a: t, F: 0.5 * P.k_coll * dl[i], tag: "collision" });
+      }
+    }
+    for (let i = 0; i < be.length; i += 2) { // ∮ r × (−Γ_out n) dℓ = −R² Σ_edges Γ_out (x_b − x_a), exact for uniform Γ_out
+      const a = be[i], b2 = be[i + 1], G = 0.5 * (gOut[pl.bidx[a]] + gOut[pl.bidx[b2]]);
+      for (let c = 0; c < 3; c++) tau[o + c] -= G * R2 * (w[3 * b2 + c] - w[3 * a + c]);
+    }
+    // slab pull (§11.6): each slab column's down-dip weight, with retained crust as eclogite, is carried by the
+    // surface boundary vertex it hangs from (pl.sdv, from updateSlabs), along that vertex's outward normal
+    if (!pl.snt) return;
+    const pull = new Float64Array(nb), under = new Int32Array(nb).fill(-1), dw = new Float64Array(nb), ww = new Float64Array(nb), aw = new Float64Array(nb);
+    for (let k = 0; k < pl.n; k++) {
+      if (pl.sub[k] !== 1 || !(As[k] > 0)) continue;
+      const bv = pl.sdv[k], i = bv >= 0 ? pl.bidx[bv] : -1; if (!(i >= 0)) continue;
+      const B = buoyancy(pl.Vc[k] / As[k], P.rho_ecl, pl.rhom[k], pl.L[k]);
+      pull[i] += P.e_sp * P.g * sinT * Math.max(-B, 0) * As[k];
+      under[i] = pl.under[k];
+      if (pl.sd[k] <= dInt) { dw[i] += pl.D[k] * As[k]; ww[i] += pl.w[k] * As[k]; aw[i] += As[k]; }
+    }
+    for (let i = 0; i < nb; i++) {
+      if (under[i] < 0) continue;
+      const q = uidIx.get(under[i]), v = pl.bvert[i], x = [w[3 * v], w[3 * v + 1], w[3 * v + 2]], n = [pl.bn[3 * i], pl.bn[3 * i + 1], pl.bn[3 * i + 2]];
+      const xn = [x[1] * n[2] - x[2] * n[1], x[2] * n[0] - x[0] * n[2], x[0] * n[1] - x[1] * n[0]];
+      for (let c = 0; c < 3; c++) tau[o + c] += pull[i] * R * xn[c];
+      F.slab += pull[i];
+      if (q === undefined || q === p) continue;
+      // trench suction on the overriding plate, directed out of it (towards p)
+      for (let c = 0; c < 3; c++) tau[3 * q + c] -= P.xi_s * pull[i] * R * xn[c];
+      F.suction += P.xi_s * pull[i];
+      // interface friction (§11.6): wet, damaged interfaces are weak; overburden from the overriding column
+      const Db = aw[i] ? dw[i] / aw[i] : pl.D[v], wb = aw[i] ? ww[i] / aw[i] : pl.w[v];
+      const ov = pl.bq[i] === q && pl.bqv[i] >= 0 ? [plates[q], pl.bqv[i]] : [pl, v], qo = ov[0], ko = ov[1];
+      const Ip = pressureIntegral(P.z_int, Math.min(qo.e[ko], 0), qo.Vc[ko] / qo.A[ko], qo.rhoc[ko], qo.rhom[ko], qo.L[ko]);
+      const Fint = P.mu_f * (1 - P.a_b * Db) * (1 - (P.lam0 + (P.lam1 - P.lam0) * wb)) / sinT * Ip;
+      elems.push({ kind: 0, p, q, x, a: null, F: Fint * cosT * dl[i], tag: "interface" });
+    }
+  });
+  // Solve by Newton's method with backtracking line search on the convex dissipation potential
+  //   Φ(ω) = ½ ωᵀK_drag ω − τᵀω + Σ_friction F √(|slip|² + v_reg²) + Σ_collision ½ k ⟨v_n⟩²,
+  // whose stationary point is the torque balance. (Iteratively reweighted least squares stalls when started from
+  // a locked state, where every friction weight is huge.)
+  let om = new Float64Array(n3);
+  plates.forEach((pl, p) => { const src = pl.omDyn[0] || pl.omDyn[1] || pl.omDyn[2] ? pl.omDyn : pl.om; for (let c = 0; c < 3; c++) om[3 * p + c] = src[c]; });
+  const vr2 = P.v_reg * P.v_reg;
+  function evalPhi(om, H) {
+    const G = new Float64Array(n3); let phi = 0;
+    for (let i = 0; i < n3; i++) { let kv = 0; for (let j = 0; j < n3; j++) kv += K0[i * n3 + j] * om[j]; phi += 0.5 * om[i] * kv - tau[i] * om[i]; G[i] = kv - tau[i]; }
+    if (H) H.set(K0);
+    for (const e of elems) {
+      const op = 3 * e.p, oq = 3 * e.q, x = e.x;
+      const dw0 = om[op] - om[oq], dw1 = om[op + 1] - om[oq + 1], dw2 = om[op + 2] - om[oq + 2];
+      let g, M = null;
+      if (e.kind === 0) {
+        const ux = R * (dw1 * x[2] - dw2 * x[1]), uy = R * (dw2 * x[0] - dw0 * x[2]), uz = R * (dw0 * x[1] - dw1 * x[0]);
+        const S = Math.sqrt(ux * ux + uy * uy + uz * uz + vr2), c = e.F / S;
+        phi += e.F * S;
+        const j0 = R * (x[1] * uz - x[2] * uy), j1 = R * (x[2] * ux - x[0] * uz), j2 = R * (x[0] * uy - x[1] * ux); // Jᵀu = R x × u
+        g = [c * j0, c * j1, c * j2];
+        if (H) { const r2 = R2, iS2 = 1 / (S * S), J = [j0, j1, j2];
+          M = []; for (let r = 0; r < 3; r++) for (let k = 0; k < 3; k++) M.push(c * (r2 * ((r === k ? 1 : 0) - x[r] * x[k]) - J[r] * J[k] * iS2)); }
+      } else {
+        const a = e.a, v = R * (dw0 * a[0] + dw1 * a[1] + dw2 * a[2]);
+        let gs, hs;
+        if (e.kind === 1) { const S = Math.sqrt(v * v + vr2); phi += e.F * S; gs = e.F * v / S; hs = e.F * vr2 / (S * S * S); }
+        else { const vp = Math.max(v, 0); phi += 0.5 * e.F * vp * vp; gs = e.F * vp; hs = v > 0 ? e.F : 0; }
+        g = [gs * R * a[0], gs * R * a[1], gs * R * a[2]];
+        if (H && hs) { const c = hs * R2; M = [c * a[0] * a[0], c * a[0] * a[1], c * a[0] * a[2], c * a[1] * a[0], c * a[1] * a[1], c * a[1] * a[2], c * a[2] * a[0], c * a[2] * a[1], c * a[2] * a[2]]; }
+      }
+      for (let c = 0; c < 3; c++) { G[op + c] += g[c]; G[oq + c] -= g[c]; }
+      if (M) for (let r = 0; r < 3; r++) for (let c = 0; c < 3; c++) {
+        const m = M[3 * r + c];
+        H[(op + r) * n3 + op + c] += m; H[(oq + r) * n3 + oq + c] += m; H[(op + r) * n3 + oq + c] -= m; H[(oq + r) * n3 + op + c] -= m;
+      }
+    }
+    return { phi, G };
+  }
+  const H = new Float64Array(n3 * n3), tolStep = 1e-5 * 0.01 / YR / R; // stop when no plate's speed changes by > 0.001 mm/yr
+  let it = 0, cur = evalPhi(om, H);
+  for (; it < 60; it++) {
+    const d = solveLinear(H, Float64Array.from(cur.G, x => -x), n3);
+    let gd = 0, dmax = 0; for (let i = 0; i < n3; i++) { gd += cur.G[i] * d[i]; dmax = Math.max(dmax, Math.abs(d[i])); }
+    if (!(gd < 0)) break;
+    let t = 1, trial, nw;
+    for (let ls = 0; ls < 40; ls++, t *= 0.5) {
+      nw = om.map((v, i) => v + t * d[i]); trial = evalPhi(nw, null);
+      if (trial.phi <= cur.phi + 1e-4 * t * gd) break;
+    }
+    om = nw;
+    if (dmax < tolStep) break;                       // full Newton step negligible (not merely a short line-search step)
+    cur = evalPhi(om, H);
+  }
+  plates.forEach((pl, p) => { pl.omDyn = [om[3 * p], om[3 * p + 1], om[3 * p + 2]]; });
+  // diagnostics: mobilised friction (force actually exerted, ≤ F) by type, in N
+  for (const e of elems) {
+    const dw = [om[3 * e.p] - om[3 * e.q], om[3 * e.p + 1] - om[3 * e.q + 1], om[3 * e.p + 2] - om[3 * e.q + 2]], x = e.x;
+    let v;
+    if (e.kind === 0) v = R * Math.hypot(dw[1] * x[2] - dw[2] * x[1], dw[2] * x[0] - dw[0] * x[2], dw[0] * x[1] - dw[1] * x[0]);
+    else v = R * Math.abs(dw[0] * e.a[0] + dw[1] * e.a[1] + dw[2] * e.a[2]);
+    F[e.tag] += e.kind === 2 ? e.F * Math.max(0, R * (dw[0] * e.a[0] + dw[1] * e.a[1] + dw[2] * e.a[2])) : e.F * v / Math.sqrt(v * v + vr2);
+  }
+  F.iters = it + 1;
+  W.forces = F;
+}
+
+// §10 damage, rigid-plate form. With rigid plates all viscoplastic strain is slip at boundaries, so breakdown acts
+// on boundary columns in contact with another plate, at strain rate |slip|/ℓ_D (tangential slip at contacts,
+// total relative velocity at trenches). Healing (τ_h from the temperature at ζ_h) acts on every surface column.
+// Integrated exactly for one step: dD/dt = a(1 − D) − bD.
+function damageStep(W, dt) {
+  const cc = 0.5 * W.s;
+  for (const pl of W.plates) {
+    const a = new Float64Array(pl.n);
+    for (let i = 0; i < pl.bvert.length; i++) {
+      const cls = pl.bcls[i], tr = cls === CLS.TRENCH;
+      if (!tr && !(pl.bq[i] >= 0 && pl.bq[i] !== pl.id && pl.bgap[i] < cc)) continue;
+      const slip = tr ? Math.hypot(pl.bvn[i], pl.bvt[i]) : Math.abs(pl.bvt[i]);
+      a[pl.bvert[i]] = P.k_D * slip / P.ell_D;
+    }
+    for (let k = 0; k < pl.n; k++) {
+      if (pl.sub[k]) continue;
+      const Th = P.Ts + (P.TL - P.Ts) / Math.max(pl.L[k], 1) * P.zeta_h + 273.15;
+      const b = 1 / (P.tau_h0 * Math.exp(Math.min(P.Q_h / P.Rg * (1 / Th - 1 / (P.T_h0 + 273.15)), 600)));
+      if (!a[k] && pl.D[k] === 0) continue;
+      const Dinf = a[k] / (a[k] + b);
+      pl.D[k] = Dinf + (pl.D[k] - Dinf) * Math.exp(-(a[k] + b) * dt);
+    }
+  }
+}
+
 // ---------- time step (§14), M1 subset ----------
 function step(W, dtMyr) {
-  // boundary events first, using the contact geometry of the current (unchanged) positions
-  for (const pl of W.plates) { spread(W, pl); fillHoles(W, pl); }
   const dt = dtMyr * MYR, dq = new THREE.Quaternion(), a2k = P.aL * P.aL * P.kappa * dt;
+  // velocities from the torque balance (needs the contact geometry left by the previous step, so before any
+  // boundary event rebuilds the boundary arrays), blended from the prescribed spin-up motion over t_spin
+  solveTorques(W);
+  const r = W.tSpin > 0 ? smoothstep(0, W.tSpin, W.time) : 1;
+  for (const pl of W.plates) for (let c = 0; c < 3; c++) pl.om[c] = (1 - r) * pl.omKin[c] + r * pl.omDyn[c];
+  damageStep(W, dt);
+  // boundary events, using the contact geometry of the current (unchanged) positions
+  for (const pl of W.plates) { spread(W, pl); fillHoles(W, pl); }
   crustalFlow(W, dt);
   for (const pl of W.plates) {
-    dq.setFromAxisAngle(pl.axis, pl.omega * dt); pl.q.premultiply(dq);
+    const wl = Math.hypot(pl.om[0], pl.om[1], pl.om[2]);
+    if (wl > 0) { dq.setFromAxisAngle(new THREE.Vector3(pl.om[0] / wl, pl.om[1] / wl, pl.om[2] / wl), wl * dt); pl.q.premultiply(dq); }
     for (let k = 0; k < pl.n; k++) {
       if (pl.sub[k]) continue;
       const Lm = Lmax(pl.rhom[k]); let L = pl.L[k];
@@ -1538,6 +1836,7 @@ const MAPS = {
           lo: -7000, hi: 5000, ticks: ["−7 km", "0", "+5 km"] },
   L:    { f: ramp([[0, 0xfde7a5], [30e3, 0xf3a65a], [70e3, 0xc1527a], [120e3, 0x6a2c91], [230e3, 0x1b1446]]), lo: 0, hi: 230e3, ticks: ["0", "115", "230 km"] },
   hc:   { f: ramp([[0, 0x1b2a4a], [8e3, 0x2f5f8a], [20e3, 0x89a86a], [35e3, 0xd9b36a], [60e3, 0xf6efe0]]), lo: 0, hi: 60e3, ticks: ["0", "30", "60 km"] },
+  D:    { f: ramp([[0, 0x1c2433], [0.3, 0x3d4f6b], [0.7, 0xd9774a], [1, 0xffe08a]]), lo: 0, hi: 1, ticks: ["0", "0.5", "1"] },
 };
 const CLS_RGB = CLS_COLOR.map(h => [((h >> 16) & 255) / 255, ((h >> 8) & 255) / 255, (h & 255) / 255]);
 
@@ -1569,6 +1868,7 @@ const ui = {
   dt: document.getElementById("dt"), exag: document.getElementById("exag"), nv: document.getElementById("nv"),
   cf: document.getElementById("cf"), np: document.getElementById("np"), seed: document.getElementById("seed"),
   mode: document.getElementById("mode"), bounds: document.getElementById("bounds"), slabs: document.getElementById("slabs"),
+  spin: document.getElementById("spin"), arrows: document.getElementById("arrows"),
 };
 const dtVal = () => +(0.05 * Math.pow(100, ui.dt.value / 100)).toPrecision(2);        // 0.05 … 5 Myr
 const nvVal = () => Math.round(Math.pow(10, 3 + 2.2 * ui.nv.value / 100) / 500) * 500;  // ~1 000 … 160 000
@@ -1631,6 +1931,7 @@ function columnColour(pl, v, mode, col, o) {
   if (mode === "elev") MAPS.elev.f(pl.e[v], col, o);
   else if (mode === "L") MAPS.L.f(pl.L[v], col, o);
   else if (mode === "hc") MAPS.hc.f(pl.Vc[v] / pl.A[v], col, o);
+  else if (mode === "D") MAPS.D.f(pl.D[v], col, o);
   else { tmpC.setHSL(pl.hue, 0.45, mode === "mesh" ? 0.3 : pl.Vc[v] / pl.A[v] > 15e3 ? 0.66 : 0.42); col[o] = tmpC.r; col[o + 1] = tmpC.g; col[o + 2] = tmpC.b; }
 }
 
@@ -1663,8 +1964,37 @@ function refreshSeams(k, mode) {
   seamWire.visible = mode === "mesh";
 }
 
+// plate-velocity arrows on a fixed set of world-frame points (a subset of the coverage probes); each arrow fades
+// from dark at its tail to bright at its head
+const ARROW_SCALE = 0.044 / (0.05 / YR / P.R);   // 5 cm/yr → 0.044 planet radii (≈ 280 km)
+const arrowGeom = new THREE.BufferGeometry();
+const arrowLines = new THREE.LineSegments(arrowGeom, new THREE.ShaderMaterial({
+  vertexColors: true, transparent: true, depthWrite: false, uniforms: { opacity: { value: 0.9 } },
+  vertexShader: SLAB_MAT.vertexShader,
+  fragmentShader: `uniform float opacity; varying vec3 vC; varying float vFacing;
+    void main() { if (vFacing < 0.12) discard; gl_FragColor = vec4(vC, opacity * min(1.0, (vFacing - 0.12) * 6.0)); }`,
+}));
+world.add(arrowLines);
+function refreshArrows(k) {
+  arrowLines.visible = ui.arrows.checked && !!W.triHash;
+  if (!arrowLines.visible) return;
+  const pr = W.probes, np = pr.length / 3, stride = Math.max(1, Math.round(np / 1400)), pos = [], col = [];
+  for (let i = 0; i < np; i += stride) {
+    const x = pr[3 * i], y = pr[3 * i + 1], z = pr[3 * i + 2];
+    let host = -1; platesContaining(W, W.triHash, x, y, z, -1, p => { if (host < 0) host = p; });
+    if (host < 0) continue;
+    const o = W.plates[host].om, r = 1 + k * 2500 + 0.004;
+    const ux = (o[1] * z - o[2] * y) * ARROW_SCALE, uy = (o[2] * x - o[0] * z) * ARROW_SCALE, uz = (o[0] * y - o[1] * x) * ARROW_SCALE;
+    pos.push(x * r, y * r, z * r, (x + ux) * r, (y + uy) * r, (z + uz) * r);
+    col.push(0.15, 0.17, 0.2, 0.95, 0.97, 1.0);
+  }
+  arrowGeom.setAttribute("position", new THREE.Float32BufferAttribute(pos, 3));
+  arrowGeom.setAttribute("color", new THREE.Float32BufferAttribute(col, 3));
+  arrowGeom.computeBoundingSphere();
+}
 function refreshGeometry() {
   const k = exagVal() / P.R, mode = ui.mode.value;
+  refreshArrows(k);
   mantle.scale.setScalar(1 + k * -6800);
   refreshSeams(k, mode);
   if (builtTopo !== W.topo || plateObjs.length !== W.plates.length) { buildPlateObjects(); return; }
@@ -1727,6 +2057,16 @@ function updateReadout() {
   let ns = 0; for (const pl of W.plates) for (let k = 0; k < pl.n; k++) if (pl.sub[k] === 1) ns++;
   document.getElementById("r-slab").textContent = ns.toLocaleString();
   document.getElementById("r-welds").textContent = W.welds;
+  let s2 = 0, vmax = 0;
+  for (const pl of W.plates) {
+    let a = 0, u2 = 0; const o = pl.om;
+    for (let k = 0; k < pl.n; k++) { if (pl.sub[k]) continue; const x = pl.wpos[3 * k], y = pl.wpos[3 * k + 1], z = pl.wpos[3 * k + 2];
+      u2 += pl.A[k] * ((o[1] * z - o[2] * y) ** 2 + (o[2] * x - o[0] * z) ** 2 + (o[0] * y - o[1] * x) ** 2); a += pl.A[k]; }
+    s2 += u2; if (a > 0.002 * tot) vmax = Math.max(vmax, Math.sqrt(u2 / a));
+  }
+  const cmyr = P.R * YR * 100;
+  document.getElementById("r-speed").textContent = (Math.sqrt(s2 / tot) * cmyr).toFixed(1) + " cm/yr";
+  document.getElementById("r-vmax").textContent = (vmax * cmyr).toFixed(1) + " cm/yr";
   document.getElementById("r-gap").textContent = (100 * W.coverage.gap).toFixed(2) + " %";
   const tl = W.blen.reduce((a, b) => a + b, 0) || 1;
   document.querySelectorAll("#mix i").forEach((el, c) => { el.style.flexGrow = W.blen[c] / tl; });
@@ -1745,7 +2085,7 @@ function drawLegend() {
 
 function reset() {
   const t0 = performance.now();
-  W = makeWorld({ N: nvVal(), contFrac: ui.cf.value / 100, nPlates: +ui.np.value, seed: +ui.seed.value || 0 });
+  W = makeWorld({ N: nvVal(), contFrac: ui.cf.value / 100, nPlates: +ui.np.value, seed: +ui.seed.value || 0, tSpin: +ui.spin.value });
   buildPlateObjects(); updateReadout();
   console.log(`world built in ${(performance.now() - t0).toFixed(0)} ms`);
 }
@@ -1778,12 +2118,14 @@ function syncLabels() {
   document.getElementById("nv-note").textContent = `mean spacing ≈ ${Math.round(Math.sqrt(4 * Math.PI / n) * P.R / 1e3)} km`;
   document.getElementById("cf-out").textContent = ui.cf.value + " %";
   document.getElementById("np-out").textContent = ui.np.value;
+  document.getElementById("spin-out").textContent = ui.spin.value + " Myr";
 }
-["dt", "exag", "nv", "cf", "np"].forEach(id => ui[id].addEventListener("input", syncLabels));
+["dt", "exag", "nv", "cf", "np", "spin"].forEach(id => ui[id].addEventListener("input", syncLabels));
 ui.exag.addEventListener("input", refreshGeometry);
 ui.mode.addEventListener("change", () => { drawLegend(); refreshGeometry(); });
 ui.bounds.addEventListener("change", refreshGeometry);
 ui.slabs.addEventListener("change", refreshGeometry);
+ui.arrows.addEventListener("change", refreshGeometry);
 const playBtn = document.getElementById("play");
 playBtn.addEventListener("click", () => { running = !running; playBtn.textContent = running ? "Pause" : "Play"; });
 document.getElementById("reset").addEventListener("click", reset);

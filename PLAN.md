@@ -14,9 +14,9 @@ prescribed behaviour with emergent behaviour.
 | 1 | **Contact geometry and spreading** | §11.1, §11.2 gap case, §11.3, §11.8 | Spatial index over boundary segments on the sphere; signed gap, v_n, v_t per boundary vertex; new strips of young plate fill gaps; boundary edge splitting; coverage metric shown in the panel | **done** (v0.2) |
 | 1.5 | **Seams** | §11.2–11.3, §11.8 | Gaps between plates are covered by seam faces (owned by no plate) rebuilt each step; plates grow to the seam midline when it widens; cracks within a plate are filled; mesh display mode | **done** (v0.3) |
 | 2 | **Overlap resolution: subduction and welding (kinematic)** | §11.4 initiation and welding, §11.5 (minus forces), §11.6 termination | Columns flagged ς=1 under the overriding plate; slab kept and deleted at d_max; felsic crust scraped and accreted; arc crust and hydration; collisions weld plates. Motions still prescribed | **done** (v0.4) |
-| 3 | **Rigid-plate torque balance** | §6 GPE, §11.5 forces, §11.4 friction, §13 (Eqs. bc, drag), §14 rigid limit | Plate angular velocities solved each step from slab pull, ridge push (Γ), basal drag, interface and transform friction. First milestone where motion is emergent. Mantle model stub supplies u^m and Υ | |
+| 3 | **Rigid-plate torque balance** | §6 GPE, §11.5 forces, §11.4 friction, §13 (Eqs. bc, drag), §14 rigid limit | Plate angular velocities solved each step from slab pull, ridge push (Γ), basal drag, interface and transform friction. First milestone where motion is emergent. Mantle model stub supplies u^m and Υ | **done** (v0.5; u^m = 0, Υ not yet used) |
 | 4 | **Strength profiles** | §7, §8, §9 | Per-column quadrature of F_b, F_d, H_e, T_e (GPU-friendly, one thread per column); display layers for them; closed-form checks of §9 run as a self-test | |
-| 5 | **Damage, rifting, splitting** | §10, §11.7 | Damage evolution with healing and diffusion; plume/upwelling damage; plates split along damaged paths and weld at sutures. Plate count becomes emergent | |
+| 5 | **Damage, rifting, splitting** | §10, §11.7 | Damage evolution with healing and diffusion; plume/upwelling damage; plates split along damaged paths and weld at sutures. Plate count becomes emergent | started (v0.5: breakdown by boundary slip, healing) |
 | 6 | **Deformable plates** | §9, §13, §14 deformable | Elasto-viscoplastic thin-sheet solve on each plate mesh (P1 finite elements, Picard iteration, probably WebGPU). Distributed deformation, mountain belts thicken crust via A_v | |
 | 7 | **Game-facing outputs** | — | Planet radius, ocean volume (sea level from conserved water rather than fixed z=0), erosion and sediment transfer, export of heightmaps and plate maps | |
 
@@ -32,8 +32,88 @@ prescribed behaviour with emergent behaviour.
   thick from coast to interior, and L 90–170 km, which puts interiors near +1 km and margins on shelves.
   This is an initial condition, not a model change, but it suggests the anchor-density table and the
   "crustal density = rock type" proxy will need a two-layer crust or a calibrated mean.
+- **New plate is thinner than its crust (found in v0.5).** L₀ = 5 km < h_c^o = 7 km, so in the layer integrals
+  the crust and the asthenosphere overlap by 2 km. Mass and buoyancy partly absorb this (the mantle layer
+  becomes negative), but Γ of the reference column came out 1.8×10¹³ N/m too high: ten times ridge push.
+  v0.5 uses max(L, h_c) as the plate thickness in every layer integral. Alternatives: L₀ ≥ h_c^o, or define L
+  as mantle-lithosphere thickness below the crust.
 - **Sea level.** The spec fixes sea level at z = 0. For generated worlds, land fraction is a key output,
   so sea level should probably come from a conserved ocean volume (milestone 7, possibly earlier).
+
+## v0.5 (milestone 3) rigid-plate torque balance
+
+What is done:
+- **Starting continents lie inside single plates.** Continents grow only on vertices at least
+  max(1.5 s, 150 km) from any plate boundary, so no continent straddles a boundary at t = 0. In 200 Myr runs
+  on three seeds there are now no welds at all (v0.4: 12 plates down to 5–8, welds from 0.5 Myr on).
+- **Column quantities (§6–9).**
+  - Γ, the gravitational potential energy (Eq. GPE), is integrated exactly (Simpson's rule on linear-density
+    layers) relative to the new-ridge column, so Γ_0 = 0. Ridge to oldest ocean is 2.2×10¹² N/m, which is the
+    classical ridge-push value. Continents sit 1.6–3.3×10¹² N/m above ridges.
+  - F_b(χ), the frictional/plastic yield resultant (Eqs. brittle, ductile, envelope, resultants), uses
+    32-point midpoint quadrature and the anchor table. For old wet ocean it is 8.6×10¹² N/m undamaged and
+    2.0×10¹² at D = 1; for continents 30–44×10¹² N/m. Only strike-slip (χ = 0) is used so far; F_d, H_e,
+    T_e and the self-tests remain milestone 4.
+- **Forces (§11.5–11.6, §12):**
+  - basal drag with u^m = 0 (Eq. drag, thickness-dependent C_b);
+  - −Γ_out n on every boundary edge (Eq. bc). Γ_out is the facing column's Γ at contacts and trenches,
+    and Γ_0 at gaps and seams. Written per edge as −R² Γ_out (x_b − x_a), the torque of a uniform Γ_out sums
+    to exactly zero around a closed boundary;
+  - slab pull: e_sp × down-dip weight of each slab column (retained crust as eclogite), applied at the
+    surface boundary vertex it hangs from, along that vertex's outward normal;
+  - trench suction ξ_s × slab pull on the overriding plate;
+  - interface friction from overburden, D̄ and w̄ of slab near the trench;
+  - contact (transform) friction: F_b(0) of the weaker column against tangential slip, counted half from each
+    side.
+- **Solver (§14 rigid limit).** One angular velocity per plate. The torque balance is the stationary point
+  of a convex dissipation potential: ½ωᵀK_drag ω − τᵀω + Σ F √(|slip|² + v_reg²) + Σ ½k⟨v_n⟩². It is
+  minimised by Newton's method with a backtracking line search, warm-started from the previous step, and
+  takes 3–9 iterations. Iteratively reweighted least squares, the first version, stalls from a locked start.
+- **Damage (§10), rigid-limit form.** All strain in a rigid plate is boundary slip, so breakdown acts on
+  boundary columns in contact, at strain rate |slip|/ℓ_D. That is tangential slip at contacts and total
+  relative velocity at trenches. Healing (τ_h from the temperature at ζ_h) acts everywhere. Young ridges heal
+  almost at once; cold lithosphere essentially never heals. There is a "Damage D" colour mode.
+- **Spin-up.** Motion starts on the old prescribed rotations, blended into the torque-balance solution over
+  t_spin (default 20 Myr, a World slider), so the first slabs can form.
+- **Display.** Plate velocity arrows; readouts of rms and fastest plate speed.
+
+Added outside the spec (to revisit):
+- **Hydration of new plate w^o = 0.7** (spec: 0, status P). This makes oceanic interfaces and transforms
+  weak through the pore-pressure ratio, as serpentinised oceanic lithosphere would. It also gives arcs a
+  hydration source, which was missing in v0.4.
+- **Slab drag** (c_slab = 2 × C_b × slab area). Without it, a plate being consumed kept its slab pull as its
+  area, and so its basal drag, went to zero; one reached 50 cm/yr. For a mature slab the cap is now about
+  15 cm/yr, close to the fastest plates on Earth.
+- **Collision resistance k_coll.** The convergence of two buoyant columns in contact meets a stiff linear
+  resistance, a stand-in for the contact normal force. It has rarely been active in tests, because continents
+  now start inside plates.
+- **Subduction initiation is still the v0.4 rule** (overlap ⇒ the less buoyant side subducts), not
+  N_c > F_b(−1): with spec strengths, no driving force could ever start subduction.
+- **The mantle is at rest** (u^m = 0), so the solution is in a frame with no basal flow.
+
+Results (11.5k vertices, 0.5 Myr steps, seeds 1–3):
+- Speeds after spin-up are 0.1–1 cm/yr. Slabs then lengthen and plates accelerate over 50–100 Myr to rms
+  1.5–2.5 cm/yr, with the fastest plates at 6–12 cm/yr.
+- At 150 Myr (35 plates over the three seeds), plate speed correlates with the fraction of the perimeter that
+  is subducting trench (r = 0.50) and anti-correlates with continental fraction (r = −0.30). Every
+  continent-bearing plate moves at ≤ 1 cm/yr and has no slab. This is the pattern Forsyth and Uyeda found
+  for Earth (1975), and it was not imposed.
+- Coverage and mesh checks are unchanged: uncovered 0.1–0.3 %, overlapped ≤ 0.1 %, no duplicate or inverted
+  triangles. A step costs 65–90 ms, of which the torque solve is a few ms.
+
+What was learned:
+- **With spec strengths and no damage, everything locks** (rms 0.2 cm/yr). Interface friction (about
+  1×10¹³ N/m dry and undamaged) is as large as a mature slab's pull, and old transforms are stronger still.
+  The spec anticipates this in its calibration note: undamaged lithosphere should resist the driving forces
+  and damaged lithosphere should not. So damage is not optional for motion; it is what defines plate
+  boundaries. That is why a rigid-limit form of §10 came forward from milestone 5.
+- **Slab pull is self-reinforcing.** Slabs lengthen only by convergence, so a slow start stays slow until
+  slabs mature (about d_max / v). Spin-up length therefore sets how long the early "sluggish" phase lasts.
+  Real slabs also sink and roll back with little convergence. Something like that would remove the
+  dependence on spin-up.
+- **A bug worth recording:** the solve first ran after spreading, which rebuilds the boundary arrays and
+  leaves the contact data stale. On every other step the solver saw no contacts and every plate locked,
+  giving a period-2 oscillation (moving, locked, moving…). The solve now runs first in the step.
 
 ## v0.4 (milestone 2) subduction, collision and welding
 
@@ -119,10 +199,10 @@ elevation about 3.5–4 km; no edge used by two triangles in the same direction,
 total crustal volume stays within 1 %. A step costs 70–90 ms on the test container.
 
 What was learned:
-- **The initial continents force early welding.** Continents are seeded independently of plates, so every
-  convergent boundary that cuts a continent is an immediate collision: 12 plates typically weld down to
-  5–8 within 25–100 Myr, and with prescribed motions and no splitting (milestone 5) the count can only fall.
-  Options: seed continents inside plates, or accept it until splitting exists.
+- **The initial continents force early welding** (fixed in v0.5). Continents are seeded independently of
+  plates, so every convergent boundary that cuts a continent is an immediate collision: 12 plates typically
+  weld down to 5–8 within 25–100 Myr, and with prescribed motions and no splitting (milestone 5) the count
+  can only fall.
 - **Every transfer of crust to "the nearest column" must be spread over an area.** Tiny dual cells at
   trenches turned single-column deposits into 100 km spikes. All transfers are now area-weighted over
   a belt.
