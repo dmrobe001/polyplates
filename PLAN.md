@@ -13,7 +13,7 @@ prescribed behaviour with emergent behaviour.
 | 0 | **Kinematic scaffold** | §2, §3, §4, §6 (isostasy), §12 (L only) | Separate plate meshes on prescribed Euler-pole rotations; per-column state; isostatic elevation; thickening of L with age; gaps open, overlaps pile up | **done** (v0.1) |
 | 1 | **Contact geometry and spreading** | §11.1, §11.2 gap case, §11.3, §11.8 | Spatial index over boundary segments on the sphere; signed gap, v_n, v_t per boundary vertex; new strips of young plate fill gaps; boundary edge splitting; coverage metric shown in the panel | **done** (v0.2) |
 | 1.5 | **Seams** | §11.2–11.3, §11.8 | Gaps between plates are covered by seam faces (owned by no plate) rebuilt each step; plates grow to the seam midline when it widens; cracks within a plate are filled; mesh display mode | **done** (v0.3) |
-| 2 | **Overlap resolution: subduction and welding (kinematic)** | §11.4 initiation and welding, §11.5 (minus forces), §11.6 termination | Columns flagged ς=1 under the overriding plate; slab kept and deleted at d_max; felsic crust scraped and accreted; arc crust and hydration; collisions weld plates. Motions still prescribed | |
+| 2 | **Overlap resolution: subduction and welding (kinematic)** | §11.4 initiation and welding, §11.5 (minus forces), §11.6 termination | Columns flagged ς=1 under the overriding plate; slab kept and deleted at d_max; felsic crust scraped and accreted; arc crust and hydration; collisions weld plates. Motions still prescribed | **done** (v0.4) |
 | 3 | **Rigid-plate torque balance** | §6 GPE, §11.5 forces, §11.4 friction, §13 (Eqs. bc, drag), §14 rigid limit | Plate angular velocities solved each step from slab pull, ridge push (Γ), basal drag, interface and transform friction. First milestone where motion is emergent. Mantle model stub supplies u^m and Υ | |
 | 4 | **Strength profiles** | §7, §8, §9 | Per-column quadrature of F_b, F_d, H_e, T_e (GPU-friendly, one thread per column); display layers for them; closed-form checks of §9 run as a self-test | |
 | 5 | **Damage, rifting, splitting** | §10, §11.7 | Damage evolution with healing and diffusion; plume/upwelling damage; plates split along damaged paths and weld at sutures. Plate count becomes emergent | |
@@ -34,6 +34,66 @@ prescribed behaviour with emergent behaviour.
   "crustal density = rock type" proxy will need a two-layer crust or a calibrated mean.
 - **Sea level.** The spec fixes sea level at z = 0. For generated worlds, land fraction is a key output,
   so sea level should probably come from a conserved ocean volume (milestone 7, possibly earlier).
+
+## v0.4 (milestone 2) subduction, collision and welding
+
+What is done:
+- **Overlap resolution (§11.4–11.5).** Every step, every surface column that lies inside another plate (a
+  boundary column only once it is more than g_tol inside) is compared with the overriding column u at
+  that point, using the column buoyancy B of Eq. buoyancy:
+  - B_v < B_u and B_v < B_crit → **subduction**: ς = 1, state frozen, kept as slab under that plate;
+  - B_v ≥ B_crit and B_u ≥ B_crit → **collision**: v's crust is spread over overriding columns within
+    d_orog = 200 km (crustal thickening), and v is consumed;
+  - otherwise u is the one to go under, which happens when its own plate is processed.
+  Subduction polarity therefore follows buoyancy locally: older ocean goes under younger ocean, ocean under
+  continent, and continents never subduct.
+- **Scraping and accretion.** Crust with ρ_0,c < ρ_scr is scraped off a subducting column: f_acc onto the
+  overriding plate and the rest onto the subducting plate's edge, each spread area-weighted over
+  columns within d_arc. ρ_scr is raised from the spec's 2850 to 2900 kg/m³, because v0.1 seeds continents at
+  exactly 2850 (a whole-crust mean), and "ρ < ρ_scr" would never scrape them.
+- **Arc processes.** Each subducted column adds arc crust q_arc·A_v (ρ_arc) and hydration k_w·w_v·A_v to
+  overriding columns within d_arc, area-weighted. This event-based form is equivalent to the spec's rates
+  (thickness rate q_arc·v_c/d_arc). Hydration is currently zero in practice, because new plate has w^o = 0
+  and nothing else hydrates sea floor.
+- **Slabs.** Subducted triangles move from the plate's surface list to a slab list; they ride with their
+  plate. Each slab column's map distance d_v from the trench is recomputed every step as its distance (in
+  the plate frame) to the nearest surface boundary vertex of its plate, and the column is deleted beyond
+  d_max = z_slab / sin θ_d ≈ 933 km. Slabs are drawn as a red overlay through the overriding plate.
+- **Trench class.** Boundary edges shared with slab triangles, and the facing boundary of the overriding
+  plate, are classed as trench.
+- **Welding (§11.4, §11.6).** Collisions between a pair of plates are counted; after 15 consumed columns the
+  plates weld. The merged plate keeps the larger plate's frame and turns with the area-weighted mean of
+  the two angular velocities (a kinematic stand-in for the force balance of milestone 3). Slabs of either
+  plate under the other break off, and boundary columns along the suture get D = 1.
+- **Bookkeeping.** When triangles are removed, surviving corner columns keep their h_c; in a collision, the
+  crust of their lost dual area goes to the overriding belt, while in subduction it goes down with the slab.
+  Surface pieces smaller than 1.5 mean column areas, stranded by removal, are dropped and their crust is
+  handed to the nearest surviving column.
+
+Added outside the spec (to revisit):
+- **Crustal flow as a stand-in for gravitational collapse.** Without deformable plates, collision and arc
+  growth thickened single columns without limit (196 km crust and 24 km elevations in testing). Crust
+  thicker than h_flow = 45 km now diffuses to neighbouring columns of the same plate, conserving volume,
+  with diffusivity ∝ excess thickness and time scale τ_flow = 5 Myr. Milestone 6 should replace this with
+  the physical mechanism (GPE-driven spreading of thick crust in the thin-sheet solve). Reference density
+  is not yet mixed by this flow.
+
+Results (11.5k vertices, 0.5 Myr steps, seeds 1–3, 150 Myr): overlap falls from about 27 % of the sphere
+(v0.3) to 0.03–0.1 %; uncovered stays at 0.2–0.4 %; the thickest crust is 50–57 km and the highest
+elevation about 3.5–4 km; no edge used by two triangles in the same direction, no inverted triangles;
+total crustal volume stays within 1 %. A step costs 70–90 ms on the test container.
+
+What was learned:
+- **The initial continents force early welding.** Continents are seeded independently of plates, so every
+  convergent boundary that cuts a continent is an immediate collision: 12 plates typically weld down to
+  5–8 within 25–100 Myr, and with prescribed motions and no splitting (milestone 5) the count can only fall.
+  Options: seed continents inside plates, or accept it until splitting exists.
+- **Every transfer of crust to "the nearest column" must be spread over an area.** Tiny dual cells at
+  trenches turned single-column deposits into 100 km spikes. All transfers are now area-weighted over
+  a belt.
+- **A bug worth recording:** iterating triangle edges with "skip if a > b" visits each interior edge once,
+  but drops half of the boundary edges entirely, since those belong to a single triangle. The crustal flow
+  could not drain columns that touched only such edges.
 
 ## v0.3 (milestone 1.5) seams
 

@@ -99,7 +99,7 @@ select { width: 100%; background: #10161f; color: var(--fg); border: 1px solid v
 
 <aside id="panel">
   <header>
-    <h1>Polyplates<small>v0.3 seams</small></h1>
+    <h1>Polyplates<small>v0.4 subduction</small></h1>
     <button id="collapse" aria-expanded="true" aria-controls="body">hide</button>
   </header>
   <div id="body">
@@ -112,6 +112,8 @@ select { width: 100%; background: #10161f; color: var(--fg); border: 1px solid v
       <div><span>overlapped</span><b id="r-over">–</b></div>
       <div><span>seam</span><b id="r-seam">–</b></div>
       <div><span>crack fills</span><b id="r-fills">–</b></div>
+      <div><span>slab columns</span><b id="r-slab">–</b></div>
+      <div><span>welds</span><b id="r-welds">–</b></div>
     </div>
 
     <div class="mixbox">
@@ -172,6 +174,7 @@ select { width: 100%; background: #10161f; color: var(--fg); border: 1px solid v
       <p id="mesh-note" class="meshnote" hidden>Every triangle drawn. Faces and edges take their plate's colour;
         <span class="seamsw"></span> seam faces belong to no plate and are rebuilt each step.</p>
       <label class="check"><input id="bounds" type="checkbox" checked> Boundaries coloured by type</label>
+      <label class="check"><input id="slabs" type="checkbox" checked> Slabs (drawn through the overriding plate)</label>
     </fieldset>
 
     <div class="status">
@@ -180,7 +183,9 @@ select { width: 100%; background: #10161f; color: var(--fg); border: 1px solid v
       and relative velocity. Gaps between plates are covered by seam faces rebuilt every step; when a seam
       grows wider than about one vertex spacing, both plates grow to its midline as new sea floor. Cracks within a
       single plate are filled outright. <span class="gap">Orange</span> is open mantle that nothing covers yet.
-      Overlaps are detected but not yet resolved (subduction comes next).
+      Where plates overlap, the denser column subducts and is kept as slab (red overlay) until it is
+      933 km from the trench; buoyant columns that collide hand their crust to the overriding plate, and plates
+      that keep colliding weld into one. Motions are still prescribed.
     </div>
   </div>
 </aside>
@@ -207,6 +212,17 @@ const P = {
   L0: 5e3, hc_o: 7e3, rhoc_o: 2950, rhom_o: 3360,
   e_ref: -2500,
   rhoc_cont: 2850,                    // initial continental crust (calibrated in v0.1, see PLAN.md)
+  // §11.4–11.6 subduction (Table: Subduction)
+  B_crit: 5e6,                        // buoyancy above which a column cannot subduct (kg/m²)
+  rho_scr: 2900,                      // crust lighter than this is scraped off (spec: 2850; raised so 2850 continental crust scrapes)
+  f_acc: 0.5,                         // fraction of scraped crust accreted to the overriding plate
+  theta_d: 45 * Math.PI / 180,        // representative slab dip
+  z_slab: 660e3,                      // depth limit of slab pull
+  d_arc: 150e3, k_w: 1, q_arc: 1e3, rho_arc: 2800,
+  d_orog: 200e3,                      // collision crust is spread over overriding columns within this distance
+  // Stand-in for gravitational collapse until deformable plates (milestone 6): crust thicker than h_flow
+  // diffuses to neighbouring columns of the same plate, volume conserved, at a rate rising with the excess.
+  h_flow: 45e3, tau_flow: 5 * MYR,
 };
 // Numerical parameters (status N), as multiples of the mean spacing s
 const NUM = {
@@ -217,11 +233,13 @@ const NUM = {
   reach: 1.0,      // largest extension per event when the far side is out of range
   cell: 3.0,       // spatial-hash cell size for boundary segments
   seamMax: 2.2,    // longest edge of a seam (or crack-fill) triangle
+  weld: 15,        // collision-consumed columns between two plates before they weld
 };
 const NEAR_SELF = 4;   // own boundary edges this close along the loop are not "across a gap"
-const CLS = { GAP: 0, DIV: 1, TRANS: 2, CONV: 3, OVER: 4 };
-const CLS_COLOR = [0xffa94d, 0xffe066, 0x69db7c, 0xff5c6c, 0xd68cff];
-const CLS_NAME = ["open gap", "spreading", "transform", "convergent", "overlap"];
+const CLS = { GAP: 0, DIV: 1, TRANS: 2, CONV: 3, OVER: 4, TRENCH: 5 };
+const CLS_COLOR = [0xffa94d, 0xffe066, 0x69db7c, 0x74c0fc, 0xd68cff, 0xff4d6d];
+const CLS_NAME = ["open gap", "spreading", "transform", "convergent", "overlap", "trench"];
+const D_MAX = P.z_slab / Math.sin(P.theta_d);   // slab columns farther than this from the trench are deleted
 
 // ---------- small vector helpers on flat arrays ----------
 const dot3 = (a, i, b, j) => a[i] * b[j] + a[i + 1] * b[j + 1] + a[i + 2] * b[j + 2];
@@ -274,6 +292,12 @@ function isostaticElevation(e, hc, rc, rm, L, iters) {
   }
   return e;
 }
+// Eq. buoyancy: net buoyancy per unit area relative to asthenosphere at the same depth below the surface
+function buoyancy(hc, rc, rm, L) {
+  const G = (P.TL - P.Ts) / L;
+  return P.rho_a0 * (L * (1 - P.alpha * (P.Tp - P.T0)) - P.alpha * P.gad * L * L / 2) - layerMass(rc, 0, hc, G) - layerMass(rm, hc, L, G);
+}
+const colB = (pl, k) => buoyancy(pl.Vc[k] / pl.A[k], pl.rhoc[k], pl.rhom[k], pl.L[k]);
 function Lmax(rm) {
   const s = Math.min(Math.max((P.rho_a0 - rm) / (P.rho_a0 - P.rho_dep), 0), 1);
   return P.Lmax_o + (P.Lmax_cr - P.Lmax_o) * s;
@@ -407,8 +431,12 @@ function partitionPlates(S, nP, rng) {
 
 // ---------- growable plate meshes ----------
 const F64 = ["A", "Vc", "rhoc", "rhom", "L", "e"], F32 = ["w", "D"], V3 = ["pos", "wpos"];
+// sub: 0 surface column, 1 slab (subducted, frozen), 2 consumed in a collision, 3 slab deleted, 4 orphaned
+// tri holds surface triangles only; stri holds slab triangles (kept for display)
+let PLATE_UID = 0;
 function newPlate(id, axis, omega, hue) {
-  return { id, axis, omega, hue, q: new THREE.Quaternion(), n: 0, cap: 0, nt: 0, tcap: 0, tri: new Uint32Array(0), version: 0 };
+  return { id, uid: PLATE_UID++, axis, omega, hue, q: new THREE.Quaternion(), n: 0, cap: 0, nt: 0, tcap: 0, tri: new Uint32Array(0),
+           snt: 0, stri: new Uint32Array(0), version: 0 };
 }
 function growPlate(pl, need) {
   if (need <= pl.cap) return;
@@ -416,13 +444,17 @@ function growPlate(pl, need) {
   for (const f of F64) cp(Float64Array, f, 1);
   for (const f of F32) cp(Float32Array, f, 1);
   for (const f of V3) cp(Float64Array, f, 3);
-  cp(Float32Array, "T", 3); cp(Uint8Array, "sub", 1);
+  cp(Float32Array, "T", 3); cp(Uint8Array, "sub", 1); cp(Int32Array, "under", 1); cp(Float64Array, "sd", 1);
   pl.cap = cap;
 }
 function addVertex(pl, x, y, z) { growPlate(pl, pl.n + 1); const k = pl.n++; pl.pos[3 * k] = x; pl.pos[3 * k + 1] = y; pl.pos[3 * k + 2] = z; return k; }
 function addTri(pl, a, b, c) {
   if (pl.nt + 1 > pl.tcap) { const cap = Math.ceil(pl.tcap * 1.5) + 128, t = new Uint32Array(3 * cap); t.set(pl.tri.subarray(0, 3 * pl.nt)); pl.tri = t; pl.tcap = cap; }
   pl.tri[3 * pl.nt] = a; pl.tri[3 * pl.nt + 1] = b; pl.tri[3 * pl.nt + 2] = c; pl.nt++;
+}
+function addSlabTri(pl, a, b, c) {
+  if (3 * (pl.snt + 1) > pl.stri.length) { const t = new Uint32Array(Math.max(384, 2 * pl.stri.length)); t.set(pl.stri.subarray(0, 3 * pl.snt)); pl.stri = t; }
+  pl.stri[3 * pl.snt] = a; pl.stri[3 * pl.snt + 1] = b; pl.stri[3 * pl.snt + 2] = c; pl.snt++;
 }
 function computeAreas(pl) {
   pl.A.fill(0, 0, pl.n);
@@ -445,6 +477,13 @@ function extractBoundary(pl) {
   const be = [], code = [];
   for (let h = 0; h < M; h++) { const c = val[h]; if (keys[h] !== -1 && c >= 0) { const t = (c / 3) | 0, e = c % 3; be.push(pl.tri[3 * t + e], pl.tri[3 * t + (e + 1) % 3]); code.push(c); } }
   pl.bedge = Uint32Array.from(be); pl.bcode = Int32Array.from(code);
+  // trench edges: surface boundary edges that are also edges of a slab triangle
+  pl.etrench = new Uint8Array(be.length / 2);
+  if (pl.snt) {
+    const sk = new Set();
+    for (let t = 0; t < pl.snt; t++) for (let e = 0; e < 3; e++) { const a = pl.stri[3 * t + e], b = pl.stri[3 * t + (e + 1) % 3]; sk.add(Math.min(a, b) * n + Math.max(a, b)); }
+    for (let i = 0; i < be.length; i += 2) if (sk.has(Math.min(be[i], be[i + 1]) * n + Math.max(be[i], be[i + 1]))) pl.etrench[i / 2] = 1;
+  }
   pl.bidx = new Int32Array(n).fill(-1);
   const bv = [];
   for (const v of be) if (pl.bidx[v] < 0) { pl.bidx[v] = bv.length; bv.push(v); }
@@ -569,7 +608,7 @@ function makeWorld(opts) {
   // coverage probes: a fixed set of points in the world frame
   const np = Math.min(8000, N), probes = new Float64Array(3 * np), ga = Math.PI * (3 - Math.sqrt(5));
   for (let i = 0; i < np; i++) { const z = 1 - (2 * i + 1) / np, r = Math.sqrt(1 - z * z); probes[3 * i] = r * Math.cos(i * ga); probes[3 * i + 1] = r * Math.sin(i * ga); probes[3 * i + 2] = z; }
-  const W = { s: S.s, plates, time: 0, probes, coverage: { gap: 0, over: 0, seam: 0 }, blen: new Float64Array(5), events: 0, fills: 0 };
+  const W = { s: S.s, plates, time: 0, probes, coverage: { gap: 0, over: 0, seam: 0 }, blen: new Float64Array(6), events: 0, fills: 0, subducted: 0, consumed: 0, welds: 0, slabDeleted: 0, collide: new Map(), topo: 0 };
   for (const pl of plates) worldPositions(pl);
   contactGeometry(W);
   buildSeams(W);
@@ -597,13 +636,13 @@ function contactGeometry(W) {
   const s = W.s, plates = W.plates, hash = new SphereHash(NUM.cell * s);
   // gather all boundary segments in world coordinates
   let ns = 0; for (const pl of plates) ns += pl.bedge.length / 2;
-  const segP = new Int16Array(ns), segX = new Float64Array(6 * ns), segL = new Int32Array(ns), segO = new Int32Array(ns), segV = new Uint32Array(2 * ns);
+  const segP = new Int16Array(ns), segX = new Float64Array(6 * ns), segL = new Int32Array(ns), segO = new Int32Array(ns), segV = new Uint32Array(2 * ns), segT = new Uint8Array(ns);
   let j = 0;
   for (const pl of plates) {
     const w = pl.wpos, be = pl.bedge;
     for (let i = 0; i < be.length; i += 2, j++) {
       const a = be[i], b = be[i + 1];
-      segP[j] = pl.id; segL[j] = pl.eloop[i / 2]; segO[j] = pl.eord[i / 2]; segV[2 * j] = a; segV[2 * j + 1] = b;
+      segP[j] = pl.id; segL[j] = pl.eloop[i / 2]; segO[j] = pl.eord[i / 2]; segV[2 * j] = a; segV[2 * j + 1] = b; segT[j] = pl.etrench[i / 2];
       for (let c = 0; c < 3; c++) { segX[6 * j + c] = w[3 * a + c]; segX[6 * j + 3 + c] = w[3 * b + c]; }
       hash.insert((w[3 * a] + w[3 * b]) / 2, (w[3 * a + 1] + w[3 * b + 1]) / 2, (w[3 * a + 2] + w[3 * b + 2]) / 2, j);
     }
@@ -623,7 +662,8 @@ function contactGeometry(W) {
       const nx = ty * mz - tz * my, ny = tz * mx - tx * mz, nz = tx * my - ty * mx;
       bn[3 * ia] += nx; bn[3 * ia + 1] += ny; bn[3 * ia + 2] += nz; bn[3 * ib] += nx; bn[3 * ib + 1] += ny; bn[3 * ib + 2] += nz;
     }
-    const Wp = omegaVec[pl.id];
+    const Wp = omegaVec[pl.id], onTrench = new Uint8Array(nb);
+    for (let i = 0; i < be.length; i += 2) if (pl.etrench[i / 2]) { onTrench[pl.bidx[be[i]]] = 1; onTrench[pl.bidx[be[i + 1]]] = 1; }
     for (let i = 0; i < nb; i++) {
       const v = pl.bvert[i], x = w[3 * v], y = w[3 * v + 1], z = w[3 * v + 2];
       // project normal to the tangent plane and normalise
@@ -668,11 +708,13 @@ function contactGeometry(W) {
         pl.bmate[3 * i] = px; pl.bmate[3 * i + 1] = py; pl.bmate[3 * i + 2] = pz;
         // a facing plate exists: the boundary is named by its relative motion; "open gap" is reserved
         // for boundary with no facing plate within reach
-        if (g < -NUM.gtol * s) cls = CLS.OVER;
+        if (segT[bj] && g < 2 * s) cls = CLS.TRENCH;            // overriding side of a subduction zone
+        else if (g < -NUM.gtol * s) cls = CLS.OVER;
         else if (Math.abs(vt) > Math.abs(vn)) cls = CLS.TRANS;
         else cls = vn > 0 ? CLS.CONV : CLS.DIV;
       }
       if (bj < 0) { pl.bmate[3 * i] = NaN; }
+      if (onTrench[i]) cls = CLS.TRENCH;                          // subducting side: edge of a retained slab
       pl.bgap[i] = g; pl.bvn[i] = vn; pl.bvt[i] = vt; pl.bcls[i] = cls; pl.bq[i] = q;
     }
     for (let i = 0; i < be.length; i += 2) {
@@ -860,7 +902,7 @@ function splitLongEdges(W, pl) {
   const lim = NUM.lmax * W.s;
   for (let pass = 0; pass < 3; pass++) {
     const hc = new Float64Array(pl.n + pl.bedge.length);
-    for (let k = 0; k < pl.n; k++) hc[k] = pl.Vc[k] / pl.A[k];
+    for (let k = 0; k < pl.n; k++) hc[k] = pl.sub[k] ? 0 : pl.Vc[k] / pl.A[k];
     const used = new Uint8Array(pl.nt);
     let count = 0;
     for (let j = 0; j < pl.bcode.length; j++) {
@@ -879,7 +921,7 @@ function splitLongEdges(W, pl) {
     }
     if (!count) return;
     computeAreas(pl);
-    for (let k = 0; k < pl.n; k++) pl.Vc[k] = hc[k] * pl.A[k];
+    for (let k = 0; k < pl.n; k++) if (!pl.sub[k]) pl.Vc[k] = hc[k] * pl.A[k];
     extractBoundary(pl);
   }
 }
@@ -1032,6 +1074,273 @@ function buildSeams(W) {
   return changed;
 }
 
+// id (plate·TRI_ID + triangle) of a surface triangle of another plate containing x, or −1
+function hostTriangle(W, x, y, z, skip) {
+  let found = -1;
+  W.triHash.queryCell(x, y, z, id => {
+    if (found >= 0) return;
+    const p = Math.floor(id / TRI_ID); if (p === skip) return;
+    const t = id - p * TRI_ID, pl = W.plates[p], w = pl.wpos, a = 3 * pl.tri[3 * t], b = 3 * pl.tri[3 * t + 1], c = 3 * pl.tri[3 * t + 2];
+    const sd = (u, v) => x * (w[u + 1] * w[v + 2] - w[u + 2] * w[v + 1]) + y * (w[u + 2] * w[v] - w[u] * w[v + 2]) + z * (w[u] * w[v + 1] - w[u + 1] * w[v]);
+    if (sd(a, b) >= 0 && sd(b, c) >= 0 && sd(c, a) >= 0) found = id;
+  });
+  return found;
+}
+function addCrust(pl, k, dV, rho) {
+  if (!(dV > 0)) return;
+  const V0 = pl.Vc[k], V1 = V0 + dV;
+  pl.rhoc[k] = (pl.rhoc[k] * V0 + rho * dV) / V1; pl.Vc[k] = V1;
+}
+
+// ---------- §11.4–11.6 overlap resolution (kinematic) ----------
+// Every surface column that lies inside another plate (a boundary column only once it is more than g_tol
+// inside) is compared with the overriding column u at that point:
+//   B_v < B_u and B_v < B_crit   → v subducts: ς = 1, frozen, kept as slab under that plate
+//   B_v ≥ B_crit and B_u ≥ B_crit → collision: v's crust is transferred to u (crustal thickening) and v is consumed
+//   otherwise                     → u is the one that should go under; it is handled from the other side
+// Subduction scrapes light crust (ρ_c < ρ_scr): a fraction f_acc to u, the rest to the nearest surface
+// column of v's own plate. Each subducted column adds arc crust (q_arc·A_v, density ρ_arc) and hydration
+// (k_w·w_v·A_v) to overriding columns within d_arc.
+function resolveOverlaps(W) {
+  const s = W.s, plates = W.plates, gtol = NUM.gtol * s, ev = [];
+  for (const pl of plates) {
+    const w = pl.wpos, onSurf = new Uint8Array(pl.n);
+    for (let i = 0; i < 3 * pl.nt; i++) onSurf[pl.tri[i]] = 1;
+    for (let v = 0; v < pl.n; v++) {
+      if (!onSurf[v]) continue;
+      const bi = pl.bidx[v];
+      if (bi >= 0 && !(pl.bgap[bi] < -gtol)) continue;
+      const hid = hostTriangle(W, w[3 * v], w[3 * v + 1], w[3 * v + 2], pl.id);
+      if (hid < 0) continue;
+      const q = Math.floor(hid / TRI_ID), t = hid - q * TRI_ID, qp = plates[q];
+      let u = -1, du = Infinity;
+      for (let e = 0; e < 3; e++) { const c = qp.tri[3 * t + e], d = (qp.wpos[3 * c] - w[3 * v]) ** 2 + (qp.wpos[3 * c + 1] - w[3 * v + 1]) ** 2 + (qp.wpos[3 * c + 2] - w[3 * v + 2]) ** 2; if (d < du) { du = d; u = c; } }
+      const Bv = colB(pl, v), Bu = colB(qp, u);
+      if (Bv >= P.B_crit && Bu >= P.B_crit) ev.push(pl.id, v, q, u, 2);
+      else if (Bv < Bu && Bv < P.B_crit) ev.push(pl.id, v, q, u, 1);
+    }
+  }
+  if (!ev.length) return false;
+  // 1. flag
+  for (let i = 0; i < ev.length; i += 5) { const pl = plates[ev[i]], v = ev[i + 1]; pl.sub[v] = ev[i + 4]; pl.under[v] = plates[ev[i + 2]].uid; pl.sd[v] = 0; }
+  // 2. hash of surviving surface columns (for nearest-column and arc queries)
+  const cellR = Math.max(P.d_arc, P.d_orog) / P.R, colHash = new SphereHash(cellR);
+  for (const pl of plates) { const onSurf = new Uint8Array(pl.n); for (let i = 0; i < 3 * pl.nt; i++) onSurf[pl.tri[i]] = 1;
+    for (let k = 0; k < pl.n; k++) if (onSurf[k] && !pl.sub[k]) colHash.insert(pl.wpos[3 * k], pl.wpos[3 * k + 1], pl.wpos[3 * k + 2], pl.id * TRI_ID + k); }
+  const near = (x, y, z, plateId, maxD, cb) => colHash.query(x, y, z, id => {
+    const p = Math.floor(id / TRI_ID); if (p !== plateId) return;
+    const k = id - p * TRI_ID, w = plates[p].wpos, d = Math.hypot(w[3 * k] - x, w[3 * k + 1] - y, w[3 * k + 2] - z);
+    if (d <= maxD) cb(k, d);
+  });
+  const pending = []; // [plate, column, dV, rho]
+  for (let i = 0; i < ev.length; i += 5) {
+    const pl = plates[ev[i]], v = ev[i + 1], qp = plates[ev[i + 2]], u = ev[i + 3], kind = ev[i + 4];
+    const x = pl.wpos[3 * v], y = pl.wpos[3 * v + 1], z = pl.wpos[3 * v + 2];
+    if (kind === 2) { // collision: the consumed column's crust thickens the overriding plate over a belt d_orog wide
+      const belt = []; let Ab = 0;
+      near(x, y, z, qp.id, P.d_orog / P.R, k => { belt.push(k); Ab += qp.A[k]; });
+      if (!belt.length) { belt.push(u); Ab = qp.A[u]; }
+      for (const k of belt) pending.push(qp, k, pl.Vc[v] * qp.A[k] / Ab, pl.rhoc[v]);
+      pl.Vc[v] = 0; W.consumed++; bumpCollision(W, pl, qp); continue;
+    }
+    W.subducted++;
+    if (pl.rhoc[v] < P.rho_scr) { // scrape light crust: f_acc onto the overriding plate, the rest onto the subducting plate's edge
+      const V = pl.Vc[v]; pl.Vc[v] = 0;
+      const spreadOver = (plate, dV, fallback) => {
+        const ks = []; let As = 0;
+        near(x, y, z, plate.id, P.d_arc / P.R, k => { ks.push(k); As += plate.A[k]; });
+        if (!ks.length) { if (fallback) fallback(dV); return; }
+        for (const k of ks) pending.push(plate, k, dV * plate.A[k] / As, pl.rhoc[v]);
+      };
+      spreadOver(qp, P.f_acc * V, dV => pending.push(qp, u, dV, pl.rhoc[v]));
+      spreadOver(pl, (1 - P.f_acc) * V, dV => spreadOver(qp, dV, d2 => pending.push(qp, u, d2, pl.rhoc[v])));
+    }
+    // arc magmatism and slab fluids
+    const arc = []; let Aarc = 0;
+    near(x, y, z, qp.id, P.d_arc / P.R, k => { arc.push(k); Aarc += qp.A[k]; });
+    if (!arc.length) { arc.push(u); Aarc = qp.A[u]; }
+    const Vin = P.q_arc * pl.A[v];
+    for (const k of arc) {
+      const f = qp.A[k] / Aarc;
+      pending.push(qp, k, Vin * f, P.rho_arc);
+      qp.w[k] = Math.min(1, qp.w[k] + P.k_w * pl.w[v] * pl.A[v] * f / qp.A[k]);
+    }
+  }
+  // 3. remove surface triangles touching flagged columns; h_c of surviving corners is preserved, and the crust of
+  //    their lost dual area goes to the overriding column in a collision (or down with the slab in subduction)
+  const hostOf = new Map(); for (let i = 0; i < ev.length; i += 5) hostOf.set(ev[i] * TRI_ID + ev[i + 1], [plates[ev[i + 2]], ev[i + 3]]);
+  const touched = new Set(); for (let i = 0; i < ev.length; i += 5) touched.add(ev[i]);
+  for (const pid of touched) {
+    const pl = plates[pid], hc = new Float64Array(pl.n), R2 = P.R * P.R;
+    for (let k = 0; k < pl.n; k++) hc[k] = pl.sub[k] ? 0 : pl.Vc[k] / pl.A[k];
+    let nt = 0;
+    for (let t = 0; t < pl.nt; t++) {
+      const a = pl.tri[3 * t], b = pl.tri[3 * t + 1], c = pl.tri[3 * t + 2], sa = pl.sub[a], sb = pl.sub[b], sc = pl.sub[c];
+      if (!sa && !sb && !sc) { pl.tri[3 * nt] = a; pl.tri[3 * nt + 1] = b; pl.tri[3 * nt + 2] = c; nt++; continue; }
+      if (sa !== 2 && sb !== 2 && sc !== 2) addSlabTri(pl, a, b, c);
+      else { // collision: surviving corners' share of this triangle goes to the overriding column
+        const cons = sa === 2 ? a : sb === 2 ? b : c, host = hostOf.get(pid * TRI_ID + cons), ar = triArea(pl.pos, a, b, c) * R2 / 3;
+        for (const k of [a, b, c]) if (!pl.sub[k] && host) {
+          const qp = host[0], u = host[1], belt = []; let Ab = 0;
+          near(qp.wpos[3 * u], qp.wpos[3 * u + 1], qp.wpos[3 * u + 2], qp.id, P.d_orog / P.R, j => { belt.push(j); Ab += qp.A[j]; });
+          if (!belt.length) { belt.push(u); Ab = qp.A[u]; }
+          for (const j of belt) pending.push(qp, j, hc[k] * ar * qp.A[j] / Ab, pl.rhoc[k]);
+        }
+      }
+    }
+    pl.nt = nt;
+    computeAreas(pl);
+    for (let k = 0; k < pl.n; k++) if (!pl.sub[k]) { if (pl.A[k] > 0) pl.Vc[k] = hc[k] * pl.A[k]; else if (hc[k] > 0) pl.sub[k] = 4; }
+    removeSlivers(W, pl, near, pending);
+    extractBoundary(pl); pl.version++;
+  }
+  // 4. apply crust transfers (targets that were themselves removed this step drop their share)
+  for (let i = 0; i < pending.length; i += 4) { const pl = pending[i], k = pending[i + 1]; if (!pl.sub[k] && pl.A[k] > 0) addCrust(pl, k, pending[i + 2], pending[i + 3]); }
+  return true;
+}
+// Surface pieces smaller than 1.5 mean column areas, stranded when the triangles around them were removed,
+// are dropped; their crust goes to the nearest surviving surface column (any plate) within d_orog.
+function removeSlivers(W, pl, near, pending) {
+  const meanA = W.s * W.s * P.R * P.R, n = pl.n, parent = new Int32Array(n);
+  for (let k = 0; k < n; k++) parent[k] = k;
+  const find = i => { while (parent[i] !== i) { parent[i] = parent[parent[i]]; i = parent[i]; } return i; };
+  for (let t = 0; t < pl.nt; t++) { const a = find(pl.tri[3 * t]), b = find(pl.tri[3 * t + 1]), c = find(pl.tri[3 * t + 2]); parent[a] = c; parent[b] = c; }
+  const area = new Float64Array(n);
+  for (let k = 0; k < n; k++) if (!pl.sub[k] && pl.A[k] > 0) area[find(k)] += pl.A[k];
+  const small = r => area[r] > 0 && area[r] < 1.5 * meanA;
+  let any = false; for (let k = 0; k < n; k++) if (!pl.sub[k] && pl.A[k] > 0 && small(find(k))) { any = true; break; }
+  if (!any) return;
+  for (let k = 0; k < n; k++) {
+    if (pl.sub[k] || !(pl.A[k] > 0) || !small(find(k))) continue;
+    let best = null, bd = Infinity;
+    for (const q of W.plates) near(pl.wpos[3 * k], pl.wpos[3 * k + 1], pl.wpos[3 * k + 2], q.id, P.d_orog / P.R, (j, d) => {
+      if (q === pl && small(find(j))) return;
+      if (d < bd) { bd = d; best = [q, j]; }
+    });
+    if (best) pending.push(best[0], best[1], pl.Vc[k], pl.rhoc[k]);
+    pl.sub[k] = 4; pl.Vc[k] = 0;
+  }
+  let m = 0;
+  for (let t = 0; t < pl.nt; t++) {
+    const a = pl.tri[3 * t], b = pl.tri[3 * t + 1], c = pl.tri[3 * t + 2];
+    if (pl.sub[a] === 4 || pl.sub[b] === 4 || pl.sub[c] === 4) continue;
+    pl.tri[3 * m] = a; pl.tri[3 * m + 1] = b; pl.tri[3 * m + 2] = c; m++;
+  }
+  pl.nt = m; computeAreas(pl);
+}
+function bumpCollision(W, a, b) {
+  const key = Math.min(a.uid, b.uid) + "," + Math.max(a.uid, b.uid);
+  W.collide.set(key, (W.collide.get(key) || 0) + 1);
+}
+
+// phenomenological crustal flow (see P.h_flow): explicit diffusion of V_c along mesh edges where either end
+// is thicker than h_flow; diffusivity ∝ excess thickness, sub-stepped for stability
+function crustalFlow(W, dt) {
+  for (const pl of W.plates) {
+    let thick = false;
+    for (let k = 0; k < pl.n; k++) if (!pl.sub[k] && pl.Vc[k] > P.h_flow * pl.A[k]) { thick = true; break; }
+    if (!thick) continue;
+    const n = pl.n, h = new Float64Array(n), dV = new Float64Array(n);
+    const nsub = Math.max(1, Math.ceil(4 * dt / P.tau_flow));
+    for (let it = 0; it < nsub; it++) {
+      for (let k = 0; k < n; k++) h[k] = pl.sub[k] || !(pl.A[k] > 0) ? 0 : pl.Vc[k] / pl.A[k];
+      dV.fill(0);
+      for (let t = 0; t < pl.nt; t++) for (let e = 0; e < 3; e++) {
+        const a = pl.tri[3 * t + e], b = pl.tri[3 * t + (e + 1) % 3];   // every edge of every triangle (interior edges twice)
+        const ex = Math.max(h[a], h[b]) - P.h_flow; if (ex <= 0) continue;
+        // rate: an excess of h_flow relaxes with time scale τ_flow; flux uses the smaller cell area for stability
+        const rate = (ex / P.h_flow) * (dt / nsub) / P.tau_flow / 8;
+        const f = rate * (h[a] - h[b]) * Math.min(pl.A[a], pl.A[b]);
+        dV[a] -= f; dV[b] += f;
+      }
+      for (let k = 0; k < n; k++) if (dV[k] !== 0) pl.Vc[k] += dV[k];   // (reference density is not mixed by this flow yet)
+    }
+  }
+}
+
+// slab columns: map distance d_v from the trench (nearest surface boundary vertex of their own plate,
+// measured in the plate frame); deleted beyond d_max = z_slab / sin θ_d
+function updateSlabs(W) {
+  let changed = false;
+  const lim = D_MAX / P.R;
+  for (const pl of W.plates) {
+    if (!pl.snt) continue;
+    const h = new SphereHash(lim);
+    for (const v of pl.bvert) h.insert(pl.pos[3 * v], pl.pos[3 * v + 1], pl.pos[3 * v + 2], v);
+    let del = 0;
+    for (let k = 0; k < pl.n; k++) {
+      if (pl.sub[k] !== 1) continue;
+      const x = pl.pos[3 * k], y = pl.pos[3 * k + 1], z = pl.pos[3 * k + 2]; let best = Infinity;
+      h.query(x, y, z, v => { const d = (pl.pos[3 * v] - x) ** 2 + (pl.pos[3 * v + 1] - y) ** 2 + (pl.pos[3 * v + 2] - z) ** 2; if (d < best) best = d; });
+      const d = Math.sqrt(best) * P.R; pl.sd[k] = d;
+      if (!(d <= D_MAX)) { pl.sub[k] = 3; del++; }
+    }
+    if (del) { compactSlab(pl); W.slabDeleted += del; changed = true; }
+  }
+  return changed;
+}
+function compactSlab(pl) { // drop slab triangles with a deleted corner
+  let m = 0;
+  for (let t = 0; t < pl.snt; t++) {
+    const a = pl.stri[3 * t], b = pl.stri[3 * t + 1], c = pl.stri[3 * t + 2];
+    if (pl.sub[a] === 3 || pl.sub[b] === 3 || pl.sub[c] === 3) continue;
+    pl.stri[3 * m] = a; pl.stri[3 * m + 1] = b; pl.stri[3 * m + 2] = c; m++;
+  }
+  pl.snt = m; extractBoundary(pl); pl.version++;
+}
+
+// §11.4 welding: after sustained collision two plates become one. Kinematic stand-in for the force balance:
+// the merged plate turns with the area-weighted mean of their angular velocities. Slabs of either plate
+// under the other break off; columns along the suture get D = 1.
+function weldPlates(W) {
+  let bestKey = null, best = 0;
+  for (const [k, c] of W.collide) if (c >= NUM.weld && c > best) { best = c; bestKey = k; }
+  if (!bestKey) return false;
+  W.collide.delete(bestKey);
+  const [ua, ub] = bestKey.split(",").map(Number);
+  const pa = W.plates.find(p => p.uid === ua), pb = W.plates.find(p => p.uid === ub);
+  if (!pa || !pb) return false;
+  const area = pl => { let A = 0; for (let k = 0; k < pl.n; k++) if (!pl.sub[k]) A += pl.A[k]; return A; };
+  const [keep, gone] = area(pa) >= area(pb) ? [pa, pb] : [pb, pa];
+  const Ak = area(keep), Ag = area(gone);
+  const om = keep.axis.clone().multiplyScalar(keep.omega * Ak).add(gone.axis.clone().multiplyScalar(gone.omega * Ag)).divideScalar(Ak + Ag);
+  // move the absorbed plate's columns into the kept plate's body frame
+  const mk = qmat(keep.q), mg = qmat(gone.q), off = keep.n;
+  growPlate(keep, keep.n + gone.n);
+  for (let k = 0; k < gone.n; k++) {
+    const x = gone.pos[3 * k], y = gone.pos[3 * k + 1], z = gone.pos[3 * k + 2];
+    const wx = mg[0] * x + mg[1] * y + mg[2] * z, wy = mg[3] * x + mg[4] * y + mg[5] * z, wz = mg[6] * x + mg[7] * y + mg[8] * z;
+    const j = addVertex(keep, mk[0] * wx + mk[3] * wy + mk[6] * wz, mk[1] * wx + mk[4] * wy + mk[7] * wz, mk[2] * wx + mk[5] * wy + mk[8] * wz);
+    for (const f of [...F64, ...F32, "sub", "under", "sd"]) keep[f][j] = gone[f][k];
+    for (let c = 0; c < 3; c++) { keep.T[3 * j + c] = gone.T[3 * k + c]; keep.wpos[3 * j + c] = gone.wpos[3 * k + c]; }
+  }
+  for (let t = 0; t < gone.nt; t++) addTri(keep, gone.tri[3 * t] + off, gone.tri[3 * t + 1] + off, gone.tri[3 * t + 2] + off);
+  for (let t = 0; t < gone.snt; t++) addSlabTri(keep, gone.stri[3 * t] + off, gone.stri[3 * t + 1] + off, gone.stri[3 * t + 2] + off);
+  // slab break-off between the two
+  for (let k = 0; k < keep.n; k++) if (keep.sub[k] === 1 && ((k < off && keep.under[k] === gone.uid) || (k >= off && keep.under[k] === keep.uid))) keep.sub[k] = 3;
+  compactSlab(keep);
+  // suture damage: boundary columns of one part within 1.5 s of the other part's boundary
+  const lim = 1.5 * W.s, h = new SphereHash(lim);
+  for (const v of keep.bvert) if (v >= off) h.insert(keep.pos[3 * v], keep.pos[3 * v + 1], keep.pos[3 * v + 2], v);
+  for (const v of keep.bvert) if (v < off) {
+    let hit = false;
+    h.query(keep.pos[3 * v], keep.pos[3 * v + 1], keep.pos[3 * v + 2], u => { if (Math.hypot(keep.pos[3 * u] - keep.pos[3 * v], keep.pos[3 * u + 1] - keep.pos[3 * v + 1], keep.pos[3 * u + 2] - keep.pos[3 * v + 2]) < lim) { keep.D[u] = 1; hit = true; } });
+    if (hit) keep.D[v] = 1;
+  }
+  const len = om.length();
+  keep.axis = len > 0 ? om.normalize() : keep.axis; keep.omega = len;
+  W.plates.splice(W.plates.indexOf(gone), 1);
+  W.welds++;
+  return true;
+}
+// remove plates with no surface left, and keep ids equal to array positions
+function tidyPlates(W) {
+  const before = W.plates.length;
+  W.plates = W.plates.filter(pl => pl.nt > 0);
+  W.plates.forEach((pl, i) => { pl.id = i; });
+  if (W.plates.length !== before) W.topo++;
+}
+
 // ---------- §11.8 coverage: fraction of probe points covered by no plate (and no seam) / by more than one plate ----------
 function measureCoverage(W) {
   const hash = triangleHash(W), pr = W.probes, np = pr.length / 3, seen = new Int32Array(W.plates.length);
@@ -1066,9 +1375,11 @@ function step(W, dtMyr) {
   // boundary events first, using the contact geometry of the current (unchanged) positions
   for (const pl of W.plates) { spread(W, pl); fillHoles(W, pl); }
   const dt = dtMyr * MYR, dq = new THREE.Quaternion(), a2k = P.aL * P.aL * P.kappa * dt;
+  crustalFlow(W, dt);
   for (const pl of W.plates) {
     dq.setFromAxisAngle(pl.axis, pl.omega * dt); pl.q.premultiply(dq);
     for (let k = 0; k < pl.n; k++) {
+      if (pl.sub[k]) continue;
       const Lm = Lmax(pl.rhom[k]); let L = pl.L[k];
       if (L < Lm) L = Math.min(Lm, Math.sqrt(L * L + a2k));   // exact integral of dL/dt = a_L²κ/(2L)
       else L = Lm + (L - Lm) * Math.exp(-dt / P.tauL);        // relaxation of over-thickened plate
@@ -1078,6 +1389,10 @@ function step(W, dtMyr) {
     worldPositions(pl);
   }
   contactGeometry(W);
+  let changed = resolveOverlaps(W);
+  changed = updateSlabs(W) || changed;
+  if (weldPlates(W)) { W.topo++; changed = true; }
+  if (changed) { tidyPlates(W); contactGeometry(W); }
   if (buildSeams(W)) { contactGeometry(W); buildSeams(W); }
   W.time += dtMyr;
 }
@@ -1126,7 +1441,7 @@ scene.add(new THREE.Mesh(new THREE.SphereGeometry(1.06, 64, 48), new THREE.Shade
 const ui = {
   dt: document.getElementById("dt"), exag: document.getElementById("exag"), nv: document.getElementById("nv"),
   cf: document.getElementById("cf"), np: document.getElementById("np"), seed: document.getElementById("seed"),
-  mode: document.getElementById("mode"), bounds: document.getElementById("bounds"),
+  mode: document.getElementById("mode"), bounds: document.getElementById("bounds"), slabs: document.getElementById("slabs"),
 };
 const dtVal = () => +(0.05 * Math.pow(100, ui.dt.value / 100)).toPrecision(2);        // 0.05 … 5 Myr
 const nvVal = () => Math.round(Math.pow(10, 3 + 2.2 * ui.nv.value / 100) / 500) * 500;  // ~1 000 … 160 000
@@ -1135,7 +1450,7 @@ const exagVal = () => +ui.exag.value;
 let W = null, running = true;
 const plateObjs = [];
 
-function disposeObj(o) { world.remove(o.group); o.mesh.geometry.dispose(); o.mesh.material.dispose(); o.wire.material.dispose(); o.lines.geometry.dispose(); o.lines.material.dispose(); }
+function disposeObj(o) { world.remove(o.group); o.mesh.geometry.dispose(); o.mesh.material.dispose(); o.wire.material.dispose(); o.lines.geometry.dispose(); o.lines.material.dispose(); o.slab.geometry.dispose(); o.slab.material.dispose(); }
 function buildPlateObject(pl, i) {
   const geom = new THREE.BufferGeometry();
   geom.setAttribute("position", new THREE.BufferAttribute(new Float32Array(3 * pl.n), 3));
@@ -1149,12 +1464,19 @@ function buildPlateObject(pl, i) {
   // mesh mode: every triangle edge, drawn over the faces in a light tint of the plate's colour
   const wire = new THREE.Mesh(geom, new THREE.MeshBasicMaterial({ wireframe: true, color: new THREE.Color().setHSL(pl.hue, 0.7, 0.78), transparent: true, opacity: 0.55 }));
   wire.scale.setScalar(1.0008); wire.visible = false;
-  const group = new THREE.Group(); group.add(mesh); group.add(wire); group.add(lines); world.add(group);
-  return { group, mesh, wire, lines, version: pl.version };
+  // slab overlay: edges of retained slab triangles, drawn through the overriding plate
+  const sg = new THREE.BufferGeometry(), segs = [];
+  for (let t = 0; t < pl.snt; t++) for (let e = 0; e < 3; e++) segs.push(pl.stri[3 * t + e], pl.stri[3 * t + (e + 1) % 3]);
+  sg.setAttribute("position", new THREE.BufferAttribute(new Float32Array(3 * segs.length), 3));
+  const slab = new THREE.LineSegments(sg, new THREE.LineBasicMaterial({ color: 0xff4d6d, transparent: true, opacity: 0.22, depthTest: false }));
+  slab.userData.segs = segs; slab.renderOrder = 2;
+  const group = new THREE.Group(); group.add(mesh); group.add(wire); group.add(lines); group.add(slab); world.add(group);
+  return { group, mesh, wire, lines, slab, version: pl.version };
 }
+let builtTopo = -1;
 function buildPlateObjects() {
   for (const o of plateObjs) disposeObj(o);
-  plateObjs.length = 0;
+  plateObjs.length = 0; builtTopo = W.topo;
   W.plates.forEach((pl, i) => plateObjs.push(buildPlateObject(pl, i)));
   refreshGeometry();
 }
@@ -1201,6 +1523,8 @@ function refreshGeometry() {
   const k = exagVal() / P.R, mode = ui.mode.value;
   mantle.scale.setScalar(1 + k * -6800);
   refreshSeams(k, mode);
+  if (builtTopo !== W.topo || plateObjs.length !== W.plates.length) { buildPlateObjects(); return; }
+  const showSlab = ui.slabs.checked;
   W.plates.forEach((pl, i) => {
     if (plateObjs[i].version !== pl.version) { disposeObj(plateObjs[i]); plateObjs[i] = buildPlateObject(pl, i); }
     const o = plateObjs[i];
@@ -1212,6 +1536,12 @@ function refreshGeometry() {
       columnColour(pl, v, mode, col, 3 * v);
     }
     o.wire.visible = mode === "mesh";
+    o.slab.visible = showSlab && pl.snt > 0;
+    if (o.slab.visible) {
+      const sp = o.slab.geometry.attributes.position.array, segs = o.slab.userData.segs, r = 1 + k * -7000;
+      for (let j = 0; j < segs.length; j++) { const v = segs[j]; sp[3 * j] = pl.pos[3 * v] * r; sp[3 * j + 1] = pl.pos[3 * v + 1] * r; sp[3 * j + 2] = pl.pos[3 * v + 2] * r; }
+      o.slab.geometry.attributes.position.needsUpdate = true; o.slab.geometry.computeBoundingSphere();
+    }
     pa.needsUpdate = true; ca.needsUpdate = true;
     o.mesh.geometry.computeVertexNormals(); o.mesh.geometry.computeBoundingSphere();
     o.lines.visible = ui.bounds.checked;
@@ -1232,12 +1562,15 @@ function updateReadout() {
   document.getElementById("r-time").textContent = W.time.toFixed(1) + " Myr";
   document.getElementById("r-plates").textContent = W.plates.length;
   let n = 0, land = 0, tot = 0;
-  for (const pl of W.plates) { n += pl.n; for (let v = 0; v < pl.n; v++) { tot += pl.A[v]; if (pl.e[v] > 0) land += pl.A[v]; } }
+  for (const pl of W.plates) for (let v = 0; v < pl.n; v++) { if (pl.sub[v]) continue; n++; tot += pl.A[v]; if (pl.e[v] > 0) land += pl.A[v]; }
   document.getElementById("r-cols").textContent = n.toLocaleString();
   document.getElementById("r-land").textContent = (100 * land / tot).toFixed(1) + " %";
   document.getElementById("r-over").textContent = (100 * W.coverage.over).toFixed(1) + " %";
   document.getElementById("r-seam").textContent = (100 * W.coverage.seam).toFixed(2) + " %";
   document.getElementById("r-fills").textContent = W.fills.toLocaleString();
+  let ns = 0; for (const pl of W.plates) for (let k = 0; k < pl.n; k++) if (pl.sub[k] === 1) ns++;
+  document.getElementById("r-slab").textContent = ns.toLocaleString();
+  document.getElementById("r-welds").textContent = W.welds;
   document.getElementById("r-gap").textContent = (100 * W.coverage.gap).toFixed(2) + " %";
   const tl = W.blen.reduce((a, b) => a + b, 0) || 1;
   document.querySelectorAll("#mix i").forEach((el, c) => { el.style.flexGrow = W.blen[c] / tl; });
@@ -1294,6 +1627,7 @@ function syncLabels() {
 ui.exag.addEventListener("input", refreshGeometry);
 ui.mode.addEventListener("change", () => { drawLegend(); refreshGeometry(); });
 ui.bounds.addEventListener("change", refreshGeometry);
+ui.slabs.addEventListener("change", refreshGeometry);
 const playBtn = document.getElementById("play");
 playBtn.addEventListener("click", () => { running = !running; playBtn.textContent = running ? "Pause" : "Play"; });
 document.getElementById("reset").addEventListener("click", reset);
