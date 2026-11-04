@@ -99,7 +99,7 @@ select { width: 100%; background: #10161f; color: var(--fg); border: 1px solid v
 
 <aside id="panel">
   <header>
-    <h1>Polyplates<small>v0.4.1 subduction</small></h1>
+    <h1>Polyplates<small>v0.4.2</small></h1>
     <button id="collapse" aria-expanded="true" aria-controls="body">hide</button>
   </header>
   <div id="body">
@@ -1493,7 +1493,23 @@ const exagVal = () => +ui.exag.value;
 let W = null, running = true;
 const plateObjs = [];
 
-function disposeObj(o) { world.remove(o.group); o.mesh.geometry.dispose(); o.mesh.material.dispose(); o.wire.material.dispose(); o.lines.geometry.dispose(); o.lines.material.dispose(); o.slab.geometry.dispose(); o.slab.material.dispose(); }
+// Slab overlay: drawn through the overriding plate (no depth test), but only on the hemisphere facing the
+// camera; fragments whose outward normal points away from the viewer are discarded.
+const SLAB_MAT = new THREE.ShaderMaterial({
+  vertexColors: true, transparent: true, depthTest: false, depthWrite: false,
+  uniforms: { opacity: { value: 0.6 } },
+  vertexShader: `varying vec3 vC; varying float vFacing;
+    void main() {
+      vec4 mv = modelViewMatrix * vec4(position, 1.0);
+      vec3 centre = (modelViewMatrix * vec4(0.0, 0.0, 0.0, 1.0)).xyz;
+      vFacing = dot(normalize(mv.xyz - centre), -normalize(mv.xyz));
+      vC = color;
+      gl_Position = projectionMatrix * mv;
+    }`,
+  fragmentShader: `uniform float opacity; varying vec3 vC; varying float vFacing;
+    void main() { if (vFacing < 0.0) discard; gl_FragColor = vec4(vC, opacity); }`,
+});
+function disposeObj(o) { world.remove(o.group); o.mesh.geometry.dispose(); o.mesh.material.dispose(); o.wire.material.dispose(); o.lines.geometry.dispose(); o.lines.material.dispose(); o.slab.geometry.dispose(); }
 function buildPlateObject(pl, i) {
   const geom = new THREE.BufferGeometry();
   geom.setAttribute("position", new THREE.BufferAttribute(new Float32Array(3 * pl.n), 3));
@@ -1512,7 +1528,7 @@ function buildPlateObject(pl, i) {
   for (let t = 0; t < pl.snt; t++) for (let e = 0; e < 3; e++) segs.push(pl.stri[3 * t + e], pl.stri[3 * t + (e + 1) % 3]);
   sg.setAttribute("position", new THREE.BufferAttribute(new Float32Array(3 * segs.length), 3));
   sg.setAttribute("color", new THREE.BufferAttribute(new Float32Array(3 * segs.length), 3));
-  const slab = new THREE.LineSegments(sg, new THREE.LineBasicMaterial({ vertexColors: true, transparent: true, opacity: 0.6, depthTest: false }));
+  const slab = new THREE.LineSegments(sg, SLAB_MAT);
   slab.userData.segs = segs; slab.renderOrder = 2;
   const group = new THREE.Group(); group.add(mesh); group.add(wire); group.add(lines); group.add(slab); world.add(group);
   return { group, mesh, wire, lines, slab, version: pl.version };

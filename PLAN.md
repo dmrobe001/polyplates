@@ -91,6 +91,11 @@ Fixed in v0.4.1 (slab patches far from any visible plate edge):
   from a trench within 2 spacings of the edge of the plate they are under, and 84–93 % of footprints lie
   under that plate; the rest belong to overriding plates that have since moved away.
 
+Fixed in v0.4.2: the slab overlay is drawn without a depth test (so it shows through the overriding plate),
+which also drew slabs on the far side of the globe through the planet. Those far-side strips were the
+"slab patches in plate interiors" first reported. The overlay now discards fragments on the hemisphere
+facing away from the camera. (The v0.4.1 polarity and slab fixes were real problems, but not this one.)
+
 Added outside the spec (to revisit):
 - **Crustal flow as a stand-in for gravitational collapse.** Without deformable plates, collision and arc
   growth thickened single columns without limit (196 km crust and 24 km elevations in testing). Crust
