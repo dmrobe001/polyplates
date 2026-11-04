@@ -209,6 +209,7 @@ const NUM = {
   reach: 1.0,      // largest extension per event when the far side is out of range
   cell: 3.0,       // spatial-hash cell size for boundary segments
 };
+const NEAR_SELF = 4;   // own boundary edges this close along the loop are not "across a gap"
 const CLS = { GAP: 0, DIV: 1, TRANS: 2, CONV: 3, OVER: 4 };
 const CLS_COLOR = [0xffa94d, 0xffe066, 0x69db7c, 0xff5c6c, 0xd68cff];
 const CLS_NAME = ["gap", "spreading", "transform", "convergent", "overlap"];
@@ -442,6 +443,27 @@ function extractBoundary(pl) {
   const nb = bv.length;
   pl.bgap = new Float64Array(nb); pl.bvn = new Float64Array(nb); pl.bvt = new Float64Array(nb);
   pl.bcls = new Uint8Array(nb); pl.bn = new Float64Array(3 * nb); pl.bq = new Int16Array(nb);
+  // ordered boundary loops (edge walk; at a pinch vertex take any unused outgoing edge)
+  const nbe = be.length / 2, outStart = new Int32Array(nb + 1), outList = new Int32Array(nbe);
+  for (let e = 0; e < nbe; e++) outStart[pl.bidx[be[2 * e]] + 1]++;
+  for (let i = 0; i < nb; i++) outStart[i + 1] += outStart[i];
+  const fillp = outStart.slice(0, nb); for (let e = 0; e < nbe; e++) outList[fillp[pl.bidx[be[2 * e]]]++] = e;
+  const used = new Uint8Array(nbe);
+  pl.eloop = new Int32Array(nbe); pl.eord = new Int32Array(nbe); pl.bloop = new Int32Array(nb).fill(-1); pl.bord = new Int32Array(nb);
+  pl.loops = [];
+  for (let e0 = 0; e0 < nbe; e0++) {
+    if (used[e0]) continue;
+    const id = pl.loops.length, verts = [];
+    let e = e0;
+    while (e >= 0 && !used[e]) {
+      used[e] = 1; pl.eloop[e] = id; pl.eord[e] = verts.length;
+      const ia = pl.bidx[be[2 * e]]; if (pl.bloop[ia] < 0) { pl.bloop[ia] = id; pl.bord[ia] = verts.length; }
+      verts.push(be[2 * e]);
+      const ib = pl.bidx[be[2 * e + 1]]; e = -1;
+      for (let q = outStart[ib]; q < outStart[ib + 1]; q++) if (!used[outList[q]]) { e = outList[q]; break; }
+    }
+    pl.loops.push(Uint32Array.from(verts));
+  }
 }
 function worldPositions(pl) {
   const m = qmat(pl.q), p = pl.pos, w = pl.wpos;
@@ -564,13 +586,13 @@ function contactGeometry(W) {
   const s = W.s, plates = W.plates, hash = new SphereHash(NUM.cell * s);
   // gather all boundary segments in world coordinates
   let ns = 0; for (const pl of plates) ns += pl.bedge.length / 2;
-  const segP = new Int16Array(ns), segX = new Float64Array(6 * ns);
+  const segP = new Int16Array(ns), segX = new Float64Array(6 * ns), segL = new Int32Array(ns), segO = new Int32Array(ns);
   let j = 0;
   for (const pl of plates) {
     const w = pl.wpos, be = pl.bedge;
     for (let i = 0; i < be.length; i += 2, j++) {
       const a = be[i], b = be[i + 1];
-      segP[j] = pl.id;
+      segP[j] = pl.id; segL[j] = pl.eloop[i / 2]; segO[j] = pl.eord[i / 2];
       for (let c = 0; c < 3; c++) { segX[6 * j + c] = w[3 * a + c]; segX[6 * j + 3 + c] = w[3 * b + c]; }
       hash.insert((w[3 * a] + w[3 * b]) / 2, (w[3 * a + 1] + w[3 * b + 1]) / 2, (w[3 * a + 2] + w[3 * b + 2]) / 2, j);
     }
@@ -597,13 +619,20 @@ function contactGeometry(W) {
       nx -= d * x; ny -= d * y; nz -= d * z; const nl = Math.hypot(nx, ny, nz) || 1; nx /= nl; ny /= nl; nz /= nl;
       bn[3 * i] = nx; bn[3 * i + 1] = ny; bn[3 * i + 2] = nz;
       // inside/outside from a point-in-plate test against every other plate; |gap| from the nearest
-      // boundary segment of the containing plate (if inside) or of any other plate (if outside)
+      // boundary segment of the containing plate (if inside) or of any plate (if outside). The plate's own
+      // boundary counts too, except the stretch within NEAR_SELF edges of this vertex: this is what lets a
+      // plate fill holes and narrow bays enclosed by its own growth.
+      const myLoop = pl.bloop[i], myOrd = pl.bord[i], myLen = pl.loops[myLoop].length;
       let host = -1;
       platesContaining(W, triHash, x, y, z, pl.id, p => { if (host < 0) host = p; });
       let best = Infinity, bj = -1, bt = 0;
       hash.query(x, y, z, j => {
         const sp = segP[j];
-        if (sp === pl.id || (host >= 0 && sp !== host)) return;
+        if (host >= 0 ? sp !== host : sp === pl.id && segL[j] === myLoop) {
+          if (host >= 0) return;
+          let dd = Math.abs(segO[j] - myOrd); dd = Math.min(dd, myLen - dd);
+          if (dd <= NEAR_SELF || (myLen - dd) <= NEAR_SELF + 1 && dd <= NEAR_SELF + 1) return;
+        }
         const o = 6 * j, ax = segX[o], ay = segX[o + 1], az = segX[o + 2];
         const ux = segX[o + 3] - ax, uy = segX[o + 4] - ay, uz = segX[o + 5] - az;
         const uu = ux * ux + uy * uy + uz * uz;
@@ -680,11 +709,59 @@ function spread(W, pl) {
     else if (mb) tryTri(b, a, mb);
   }
   if (!cands.length) return false;
+  // Reject candidates that would fold over the plate: a new triangle may not cross any boundary edge of
+  // this plate (including edges of triangles accepted earlier in this event) nor contain a boundary vertex.
+  // Correct orientation and an uncovered tip are not enough near concave bends.
+  const segId = [], segX = [], eh = new SphereHash(2.5 * s);
+  const addSeg = (u, v) => {
+    put(0, u); put(3, v); const j = segId.length / 2;
+    segId.push(u, v); for (let c = 0; c < 6; c++) segX.push(P3[c]);
+    eh.insert((P3[0] + P3[3]) / 2, (P3[1] + P3[4]) / 2, (P3[2] + P3[5]) / 2, j);
+  };
+  for (let k = 0; k < be.length; k += 2) addSeg(be[k], be[k + 1]);
+  const T = new Float64Array(9), cr = (X, i, Y, j, o) => { // o = X_i × Y_j into T[o..o+2]
+    T[o] = X[i + 1] * Y[j + 2] - X[i + 2] * Y[j + 1]; T[o + 1] = X[i + 2] * Y[j] - X[i] * Y[j + 2]; T[o + 2] = X[i] * Y[j + 1] - X[i + 1] * Y[j]; };
+  const nX = new Float64Array(6), nP = new Float64Array(3);
+  const crosses = (X, i, k, j) => { // edge X[i]→X[k] (triangle coords) against stored segment j (great-circle test)
+    nX[0] = segX[6 * j]; nX[1] = segX[6 * j + 1]; nX[2] = segX[6 * j + 2]; nX[3] = segX[6 * j + 3]; nX[4] = segX[6 * j + 4]; nX[5] = segX[6 * j + 5];
+    cr(X, i, X, k, 0);
+    const s1 = nX[0] * T[0] + nX[1] * T[1] + nX[2] * T[2], s2 = nX[3] * T[0] + nX[4] * T[1] + nX[5] * T[2];
+    if (s1 * s2 >= 0) return false;
+    cr(nX, 0, nX, 3, 3);
+    const t1 = X[i] * T[3] + X[i + 1] * T[4] + X[i + 2] * T[5], t2 = X[k] * T[3] + X[k + 1] * T[4] + X[k + 2] * T[5];
+    return t1 * t2 < 0;
+  };
+  const insideTri = (X, px, py, pz) => { // strictly inside the counter-clockwise triangle X
+    nP[0] = px; nP[1] = py; nP[2] = pz;
+    for (const [i, k] of [[0, 3], [3, 6], [6, 0]]) { cr(X, i, X, k, 0); if (nP[0] * T[0] + nP[1] * T[1] + nP[2] * T[2] <= 1e-14) return false; }
+    return true;
+  };
+  const accepted = [], X = new Float64Array(9);
+  for (let k = 0; k < cands.length; k += 3) {
+    const ids = [cands[k], cands[k + 1], cands[k + 2]];
+    put(0, ids[0]); put(3, ids[1]); put(6, ids[2]); X.set(P3);
+    const cx = (X[0] + X[3] + X[6]) / 3, cy = (X[1] + X[4] + X[7]) / 3, cz = (X[2] + X[5] + X[8]) / 3;
+    let ok = true;
+    eh.query(cx, cy, cz, j => {
+      if (!ok) return;
+      const u = segId[2 * j], v = segId[2 * j + 1];
+      for (const [i, kk, ei, ek] of [[0, 3, ids[0], ids[1]], [3, 6, ids[1], ids[2]], [6, 0, ids[2], ids[0]]]) {
+        if (u === ei || u === ek || v === ei || v === ek) continue;
+        if (crosses(X, i, kk, j)) { ok = false; return; }
+      }
+      if (u !== ids[0] && u !== ids[1] && u !== ids[2] && insideTri(X, segX[6 * j], segX[6 * j + 1], segX[6 * j + 2])) ok = false;
+      else if (v !== ids[0] && v !== ids[1] && v !== ids[2] && insideTri(X, segX[6 * j + 3], segX[6 * j + 4], segX[6 * j + 5])) ok = false;
+    });
+    if (!ok) continue;
+    accepted.push(ids[0], ids[1], ids[2]);
+    addSeg(ids[0], ids[1]); addSeg(ids[1], ids[2]); addSeg(ids[2], ids[0]);
+  }
+  if (!accepted.length) return false;
   // materialise virtual vertices, add triangles, and credit their area as new sea floor
   const made = new Map(), R2 = P.R * P.R;
   const real = id => { if (id >= 0) return id; let k = made.get(id); if (k === undefined) { const r = -id - 1; k = addVertex(pl, acc[3 * r], acc[3 * r + 1], acc[3 * r + 2]); made.set(id, k); } return k; };
-  for (let k = 0; k < cands.length; k += 3) {
-    const a = real(cands[k]), b = real(cands[k + 1]), c = real(cands[k + 2]);
+  for (let k = 0; k < accepted.length; k += 3) {
+    const a = real(accepted[k]), b = real(accepted[k + 1]), c = real(accepted[k + 2]);
     addTri(pl, a, b, c);
     const dA = triArea(pl.pos, a, b, c) * R2 / 3;
     addNewFloor(pl, a, dA); addNewFloor(pl, b, dA); addNewFloor(pl, c, dA);
@@ -695,6 +772,65 @@ function spread(W, pl) {
   splitLongEdges(W, pl);
   pl.version++;
   return true;
+}
+
+// Close small holes: a boundary loop that runs clockwise (the plate surrounds it), is small, and is not
+// covered by another plate is triangulated by ear clipping and credited as new sea floor.
+function fillHoles(W, pl) {
+  const s = W.s, R2 = P.R * P.R, m = qmat(pl.q);
+  let changed = false;
+  for (const loop of pl.loops) {
+    const n = loop.length;
+    if (n < 3 || n > 40) continue;
+    let cx = 0, cy = 0, cz = 0;
+    for (const v of loop) { cx += pl.pos[3 * v]; cy += pl.pos[3 * v + 1]; cz += pl.pos[3 * v + 2]; }
+    const cl = Math.hypot(cx, cy, cz); cx /= cl; cy /= cl; cz /= cl;
+    // gnomonic projection onto the tangent plane at the centroid, basis (e1, e2) with e1 × e2 = c
+    let e1x = -cy, e1y = cx, e1z = 0; if (Math.abs(cz) > 0.9) { e1x = 0; e1y = -cz; e1z = cy; }
+    const el = Math.hypot(e1x, e1y, e1z); e1x /= el; e1y /= el; e1z /= el;
+    const e2x = cy * e1z - cz * e1y, e2y = cz * e1x - cx * e1z, e2z = cx * e1y - cy * e1x;
+    const X = new Float64Array(n), Y = new Float64Array(n);
+    let far = false, area2 = 0;
+    for (let i = 0; i < n; i++) {
+      const v = loop[i], px = pl.pos[3 * v], py = pl.pos[3 * v + 1], pz = pl.pos[3 * v + 2], d = px * cx + py * cy + pz * cz;
+      if (d < 0.8) { far = true; break; }
+      X[i] = (px * e1x + py * e1y + pz * e1z) / d; Y[i] = (px * e2x + py * e2y + pz * e2z) / d;
+    }
+    if (far) continue;
+    for (let i = 0; i < n; i++) { const k = (i + 1) % n; area2 += X[i] * Y[k] - X[k] * Y[i]; }
+    if (area2 >= 0 || -area2 / 2 > 4 * s * s) continue;            // outer loop, or hole too big to close at once
+    const wx = m[0] * cx + m[1] * cy + m[2] * cz, wy = m[3] * cx + m[4] * cy + m[5] * cz, wz = m[6] * cx + m[7] * cy + m[8] * cz;
+    let covered = false; platesContaining(W, W.triHash, wx, wy, wz, pl.id, () => { covered = true; });
+    if (covered) continue;
+    // ear clipping on the reversed (counter-clockwise) polygon
+    const idx = []; for (let i = n - 1; i >= 0; i--) idx.push(i);
+    const tris = [];
+    const crs = (a, b, c) => (X[b] - X[a]) * (Y[c] - Y[a]) - (Y[b] - Y[a]) * (X[c] - X[a]);
+    let guard = 0;
+    while (idx.length > 3 && guard++ < 4 * n) {
+      let found = false;
+      for (let k = 0; k < idx.length; k++) {
+        const a = idx[(k + idx.length - 1) % idx.length], b = idx[k], c = idx[(k + 1) % idx.length];
+        if (crs(a, b, c) <= 1e-14) continue;
+        let clean = true;
+        for (const o of idx) if (o !== a && o !== b && o !== c && crs(a, b, o) > 0 && crs(b, c, o) > 0 && crs(c, a, o) > 0) { clean = false; break; }
+        if (!clean) continue;
+        tris.push(a, b, c); idx.splice(k, 1); found = true; break;
+      }
+      if (!found) break;
+    }
+    if (idx.length !== 3 || crs(idx[0], idx[1], idx[2]) <= 0) continue;
+    tris.push(idx[0], idx[1], idx[2]);
+    for (let k = 0; k < tris.length; k += 3) {
+      const a = loop[tris[k]], b = loop[tris[k + 1]], c = loop[tris[k + 2]];
+      addTri(pl, a, b, c);
+      const dA = triArea(pl.pos, a, b, c) * R2 / 3;
+      addNewFloor(pl, a, dA); addNewFloor(pl, b, dA); addNewFloor(pl, c, dA);
+    }
+    changed = true;
+  }
+  if (changed) { extractBoundary(pl); pl.version++; }
+  return changed;
 }
 
 // split boundary edges longer than ℓ_max; remeshing preserves h_c (not yet strictly conservative)
@@ -781,7 +917,7 @@ function measureCoverage(W) {
 // ---------- time step (§14), M1 subset ----------
 function step(W, dtMyr) {
   // boundary events first, using the contact geometry of the current (unchanged) positions
-  for (const pl of W.plates) spread(W, pl);
+  for (const pl of W.plates) { spread(W, pl); fillHoles(W, pl); }
   const dt = dtMyr * MYR, dq = new THREE.Quaternion(), a2k = P.aL * P.aL * P.kappa * dt;
   for (const pl of W.plates) {
     dq.setFromAxisAngle(pl.axis, pl.omega * dt); pl.q.premultiply(dq);

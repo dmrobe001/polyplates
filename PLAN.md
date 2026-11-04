@@ -74,6 +74,18 @@ What was learned:
   old boundary columns with V_c held fixed, every column would have its crust diluted once as it
   stopped being boundary. Crediting new area as new oceanic floor avoids this artifact and keeps V_c
   exactly conservative during spreading.
+- **Correct orientation and an uncovered tip do not prevent folds** (fixed in v0.2.1). Near concave bends a
+  strip triangle can be counter-clockwise and reach open space while still lying across a neighbouring
+  part of the same plate. The mesh stays manifold and consistently oriented, but it folds: in testing,
+  312 boundary vertices sat inside their own plate by 100 Myr, and the flap's edge drew as a boundary
+  loop through the plate. Each candidate triangle is now rejected if it crosses any boundary edge of its
+  plate (including triangles accepted earlier in the same event) or contains a boundary vertex.
+  Fold count is now zero on every seed tested, with no change in the uncovered fraction.
+- **A plate must also see gaps against itself** (v0.2.1). When strips grow around a gap and meet, they
+  enclose a hole that the "other plate" gap rule never measures. Gaps are now measured against the
+  plate's own boundary too, excluding the 4 edges either side of the vertex along its loop, and small
+  holes (clockwise loops under 4 s² not covered by another plate) are closed by ear clipping and
+  credited as new sea floor.
 - **Without subduction, total plate area grows.** Overlap reaches about 20 % of the sphere by 70 Myr at
   the default settings, and the number of columns grows roughly linearly (11.5k → 26k in 160 Myr).
   Milestone 2 removes area at convergent overlaps.
