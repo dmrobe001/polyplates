@@ -80,6 +80,8 @@ select { width: 100%; background: #10161f; color: var(--fg); border: 1px solid v
 #mix-key span { display: inline-flex; align-items: center; gap: 4px; }
 #mix-key i { width: 8px; height: 8px; border-radius: 1px; display: inline-block; }
 #mix-key b { color: var(--fg); font-weight: 500; }
+.meshnote { margin: 0; font-size: 11px; line-height: 1.45; color: var(--muted); }
+.seamsw { display: inline-block; width: 9px; height: 9px; border-radius: 1px; background: #fab84d; vertical-align: -1px; }
 #legend[hidden] { display: none; }
 #legend { display: flex; flex-direction: column; gap: 3px; }
 #legend canvas { width: 100%; height: 10px; border-radius: 2px; display: block; }
@@ -97,7 +99,7 @@ select { width: 100%; background: #10161f; color: var(--fg); border: 1px solid v
 
 <aside id="panel">
   <header>
-    <h1>Polyplates<small>v0.2.1 spreading</small></h1>
+    <h1>Polyplates<small>v0.3 seams</small></h1>
     <button id="collapse" aria-expanded="true" aria-controls="body">hide</button>
   </header>
   <div id="body">
@@ -108,6 +110,8 @@ select { width: 100%; background: #10161f; color: var(--fg); border: 1px solid v
       <div><span>land area</span><b id="r-land">–</b></div>
       <div><span>uncovered</span><b id="r-gap">–</b></div>
       <div><span>overlapped</span><b id="r-over">–</b></div>
+      <div><span>seam</span><b id="r-seam">–</b></div>
+      <div><span>crack fills</span><b id="r-fills">–</b></div>
     </div>
 
     <div class="mixbox">
@@ -162,16 +166,20 @@ select { width: 100%; background: #10161f; color: var(--fg); border: 1px solid v
         <option value="plate">Plate</option>
         <option value="L">Plate thickness L</option>
         <option value="hc">Crustal thickness h_c</option>
+        <option value="mesh">Mesh (plates and seams)</option>
       </select>
       <div id="legend"><canvas id="legend-bar" width="256" height="10"></canvas><div class="ticks" id="legend-ticks"></div></div>
+      <p id="mesh-note" class="meshnote" hidden>Every triangle drawn. Faces and edges take their plate's colour;
+        <span class="seamsw"></span> seam faces belong to no plate and are rebuilt each step.</p>
       <label class="check"><input id="bounds" type="checkbox" checked> Boundaries coloured by type</label>
     </fieldset>
 
     <div class="status">
       <b>Simulated now:</b> separate plate meshes on prescribed rigid rotations; per-column state;
       isostatic elevation; conductive thickening of L. Boundaries are classified each step from the signed gap
-      and relative velocity, and gaps wider than about one vertex spacing are filled with new sea floor.
-      <span class="gap">Orange</span> slivers are gaps still narrower than that.
+      and relative velocity. Gaps between plates are covered by seam faces rebuilt every step; when a seam
+      grows wider than about one vertex spacing, both plates grow to its midline as new sea floor. Cracks within a
+      single plate are filled outright. <span class="gap">Orange</span> is open mantle that nothing covers yet.
       Overlaps are detected but not yet resolved (subduction comes next).
     </div>
   </div>
@@ -208,11 +216,12 @@ const NUM = {
   merge: 0.4,      // new midline vertices closer than this are merged
   reach: 1.0,      // largest extension per event when the far side is out of range
   cell: 3.0,       // spatial-hash cell size for boundary segments
+  seamMax: 2.2,    // longest edge of a seam (or crack-fill) triangle
 };
 const NEAR_SELF = 4;   // own boundary edges this close along the loop are not "across a gap"
 const CLS = { GAP: 0, DIV: 1, TRANS: 2, CONV: 3, OVER: 4 };
 const CLS_COLOR = [0xffa94d, 0xffe066, 0x69db7c, 0xff5c6c, 0xd68cff];
-const CLS_NAME = ["gap", "spreading", "transform", "convergent", "overlap"];
+const CLS_NAME = ["open gap", "spreading", "transform", "convergent", "overlap"];
 
 // ---------- small vector helpers on flat arrays ----------
 const dot3 = (a, i, b, j) => a[i] * b[j] + a[i + 1] * b[j + 1] + a[i + 2] * b[j + 2];
@@ -442,7 +451,7 @@ function extractBoundary(pl) {
   pl.bvert = Uint32Array.from(bv);
   const nb = bv.length;
   pl.bgap = new Float64Array(nb); pl.bvn = new Float64Array(nb); pl.bvt = new Float64Array(nb);
-  pl.bcls = new Uint8Array(nb); pl.bn = new Float64Array(3 * nb); pl.bq = new Int16Array(nb);
+  pl.bcls = new Uint8Array(nb); pl.bn = new Float64Array(3 * nb); pl.bq = new Int16Array(nb); pl.bmate = new Float64Array(3 * nb).fill(NaN);
   // ordered boundary loops (edge walk; at a pinch vertex take any unused outgoing edge)
   const nbe = be.length / 2, outStart = new Int32Array(nb + 1), outList = new Int32Array(nbe);
   for (let e = 0; e < nbe; e++) outStart[pl.bidx[be[2 * e]] + 1]++;
@@ -460,6 +469,7 @@ function extractBoundary(pl) {
       const ia = pl.bidx[be[2 * e]]; if (pl.bloop[ia] < 0) { pl.bloop[ia] = id; pl.bord[ia] = verts.length; }
       verts.push(be[2 * e]);
       const ib = pl.bidx[be[2 * e + 1]]; e = -1;
+      if (pl.bloop[ib] < 0) { pl.bloop[ib] = id; pl.bord[ib] = verts.length; }
       for (let q = outStart[ib]; q < outStart[ib + 1]; q++) if (!used[outList[q]]) { e = outList[q]; break; }
     }
     pl.loops.push(Uint32Array.from(verts));
@@ -559,9 +569,10 @@ function makeWorld(opts) {
   // coverage probes: a fixed set of points in the world frame
   const np = Math.min(8000, N), probes = new Float64Array(3 * np), ga = Math.PI * (3 - Math.sqrt(5));
   for (let i = 0; i < np; i++) { const z = 1 - (2 * i + 1) / np, r = Math.sqrt(1 - z * z); probes[3 * i] = r * Math.cos(i * ga); probes[3 * i + 1] = r * Math.sin(i * ga); probes[3 * i + 2] = z; }
-  const W = { s: S.s, plates, time: 0, probes, coverage: { gap: 0, over: 0 }, blen: new Float64Array(5), events: 0 };
+  const W = { s: S.s, plates, time: 0, probes, coverage: { gap: 0, over: 0, seam: 0 }, blen: new Float64Array(5), events: 0, fills: 0 };
   for (const pl of plates) worldPositions(pl);
   contactGeometry(W);
+  buildSeams(W);
   return W;
 }
 function smoothstep(a, b, x) { const t = Math.min(Math.max((x - a) / (b - a), 0), 1); return t * t * (3 - 2 * t); }
@@ -586,13 +597,13 @@ function contactGeometry(W) {
   const s = W.s, plates = W.plates, hash = new SphereHash(NUM.cell * s);
   // gather all boundary segments in world coordinates
   let ns = 0; for (const pl of plates) ns += pl.bedge.length / 2;
-  const segP = new Int16Array(ns), segX = new Float64Array(6 * ns), segL = new Int32Array(ns), segO = new Int32Array(ns);
+  const segP = new Int16Array(ns), segX = new Float64Array(6 * ns), segL = new Int32Array(ns), segO = new Int32Array(ns), segV = new Uint32Array(2 * ns);
   let j = 0;
   for (const pl of plates) {
     const w = pl.wpos, be = pl.bedge;
     for (let i = 0; i < be.length; i += 2, j++) {
       const a = be[i], b = be[i + 1];
-      segP[j] = pl.id; segL[j] = pl.eloop[i / 2]; segO[j] = pl.eord[i / 2];
+      segP[j] = pl.id; segL[j] = pl.eloop[i / 2]; segO[j] = pl.eord[i / 2]; segV[2 * j] = a; segV[2 * j + 1] = b;
       for (let c = 0; c < 3; c++) { segX[6 * j + c] = w[3 * a + c]; segX[6 * j + 3 + c] = w[3 * b + c]; }
       hash.insert((w[3 * a] + w[3 * b]) / 2, (w[3 * a + 1] + w[3 * b + 1]) / 2, (w[3 * a + 2] + w[3 * b + 2]) / 2, j);
     }
@@ -600,6 +611,7 @@ function contactGeometry(W) {
   W.blen.fill(0);
   const triHash = triangleHash(W);
   W.triHash = triHash;
+  W.seg = { hash, segP, segV, segX };
   const omegaVec = plates.map(pl => [pl.axis.x * pl.omega * P.R, pl.axis.y * pl.omega * P.R, pl.axis.z * pl.omega * P.R]);
   for (const pl of plates) {
     const w = pl.wpos, be = pl.bedge, bn = pl.bn, nb = pl.bvert.length;
@@ -653,11 +665,14 @@ function contactGeometry(W) {
         const duz = (Wp[0] * y - Wp[1] * x) - (Wq[0] * py - Wq[1] * px);
         vn = dux * nx + duy * ny + duz * nz;                                   // >0: converging
         vt = dux * (y * nz - z * ny) + duy * (z * nx - x * nz) + duz * (x * ny - y * nx);
-        if (g > NUM.gtol * s) cls = CLS.GAP;
-        else if (g < -NUM.gtol * s) cls = CLS.OVER;
+        pl.bmate[3 * i] = px; pl.bmate[3 * i + 1] = py; pl.bmate[3 * i + 2] = pz;
+        // a facing plate exists: the boundary is named by its relative motion; "open gap" is reserved
+        // for boundary with no facing plate within reach
+        if (g < -NUM.gtol * s) cls = CLS.OVER;
         else if (Math.abs(vt) > Math.abs(vn)) cls = CLS.TRANS;
         else cls = vn > 0 ? CLS.CONV : CLS.DIV;
       }
+      if (bj < 0) { pl.bmate[3 * i] = NaN; }
       pl.bgap[i] = g; pl.bvn[i] = vn; pl.bvt[i] = vt; pl.bcls[i] = cls; pl.bq[i] = q;
     }
     for (let i = 0; i < be.length; i += 2) {
@@ -673,9 +688,16 @@ function spread(W, pl) {
   const cand = new Uint8Array(nb), tb = new Float64Array(3 * nb);
   let any = false;
   for (let i = 0; i < nb; i++) {
-    if (pl.bcls[i] !== CLS.GAP || !(pl.bgap[i] > NUM.dxacc * s)) continue;
-    const v = pl.bvert[i], d = Math.min(pl.bgap[i] / 2, NUM.reach * s);
-    let x = w[3 * v] + pl.bn[3 * i] * d, y = w[3 * v + 1] + pl.bn[3 * i + 1] * d, z = w[3 * v + 2] + pl.bn[3 * i + 2] * d;
+    if (!(pl.bgap[i] > NUM.dxacc * s)) continue;
+    const v = pl.bvert[i];
+    let x, y, z;
+    if (pl.bgap[i] <= 2 * NUM.reach * s && pl.bmate[3 * i] === pl.bmate[3 * i]) {
+      // midpoint between this vertex and its facing point: both plates aim at the same midline
+      x = w[3 * v] + pl.bmate[3 * i]; y = w[3 * v + 1] + pl.bmate[3 * i + 1]; z = w[3 * v + 2] + pl.bmate[3 * i + 2];
+    } else { // no facing plate in reach: grow along the outward normal
+      const d = Math.min(pl.bgap[i] / 2, NUM.reach * s);
+      x = w[3 * v] + pl.bn[3 * i] * d; y = w[3 * v + 1] + pl.bn[3 * i + 1] * d; z = w[3 * v + 2] + pl.bn[3 * i + 2] * d;
+    }
     const l = Math.hypot(x, y, z); x /= l; y /= l; z /= l;
     let covered = false; platesContaining(W, W.triHash, x, y, z, -1, () => { covered = true; });
     if (covered) continue;
@@ -902,16 +924,141 @@ function platesContaining(W, hash, x, y, z, skip, cb) {
   });
 }
 
-// ---------- §11.8 coverage: fraction of probe points covered by no plate / by more than one ----------
+// ---------- seams: the uncovered space between facing boundaries, triangulated afresh every step ----------
+// All boundary vertices of all plates are Delaunay-triangulated (two stereographic projections, each
+// trusted only in the hemisphere away from its pole). A triangle is kept if it is short, has non-trivial
+// area, lies in space no plate covers (centroid and the midpoints of edges that are not plate boundary
+// edges), crosses no plate boundary and contains no boundary vertex.
+//   - corners on one plate  → a crack in that plate: added permanently as new sea floor
+//   - corners on 2–3 plates → a seam face: owned by no plate, no state, no strength; rebuilt each step
+// Returns true if any plate was changed by a crack fill.
+function buildSeams(W) {
+  const s = W.s, plates = W.plates, maxL2 = (NUM.seamMax * s) ** 2, minO = 2e-3 * s * s;
+  let nb = 0; for (const pl of plates) nb += pl.bvert.length;
+  const ptP = new Int16Array(nb), ptV = new Uint32Array(nb), X = new Float64Array(3 * nb);
+  let k = 0;
+  for (const pl of plates) for (let i = 0; i < pl.bvert.length; i++, k++) {
+    const v = pl.bvert[i]; ptP[k] = pl.id; ptV[k] = v;
+    X[3 * k] = pl.wpos[3 * v]; X[3 * k + 1] = pl.wpos[3 * v + 1]; X[3 * k + 2] = pl.wpos[3 * v + 2];
+  }
+  const bset = plates.map(pl => { const S = new Set(), be = pl.bedge; for (let i = 0; i < be.length; i += 2) S.add(be[i] * pl.n + be[i + 1]); return S; });
+  const { hash: segHash, segP, segV, segX } = W.seg;
+  const covered = (x, y, z) => { // accepts any positive multiple of a point on the sphere
+    const l = Math.hypot(x, y, z); x /= l; y /= l; z /= l;
+    let c = false; platesContaining(W, W.triHash, x, y, z, -1, () => { c = true; }); return c;
+  };
+  const T = new Float64Array(3);
+  const crossN = (ax, ay, az, bx, by, bz) => { T[0] = ay * bz - az * by; T[1] = az * bx - ax * bz; T[2] = ax * by - ay * bx; };
+  const seamP = [], seamV = [], fills = plates.map(() => []);
+  const ids = [0, 0, 0];
+  function consider(a, b, c) {
+    for (const [u, v] of [[a, b], [b, c], [c, a]]) {
+      const dx = X[3 * u] - X[3 * v], dy = X[3 * u + 1] - X[3 * v + 1], dz = X[3 * u + 2] - X[3 * v + 2];
+      if (dx * dx + dy * dy + dz * dz > maxL2) return;
+    }
+    let o = orient(X, a, b, c);
+    if (o < 0) { const t = b; b = c; c = t; o = -o; }
+    if (o < minO) return;
+    const cx = X[3 * a] + X[3 * b] + X[3 * c], cy = X[3 * a + 1] + X[3 * b + 1] + X[3 * c + 1], cz = X[3 * a + 2] + X[3 * b + 2] + X[3 * c + 2];
+    if (covered(cx, cy, cz)) return;
+    ids[0] = a; ids[1] = b; ids[2] = c;
+    for (let e = 0; e < 3; e++) { // edges that are not existing boundary edges must run through open space
+      const u = ids[e], v = ids[(e + 1) % 3];
+      if (ptP[u] === ptP[v] && bset[ptP[u]].has(ptV[v] * plates[ptP[u]].n + ptV[u])) continue;
+      if (covered(X[3 * u] + X[3 * v], X[3 * u + 1] + X[3 * v + 1], X[3 * u + 2] + X[3 * v + 2])) return;
+    }
+    let ok = true;
+    const same = (j, end, pi) => segP[j] === ptP[pi] && segV[2 * j + end] === ptV[pi];
+    segHash.query(cx / 3, cy / 3, cz / 3, j => {
+      if (!ok) return;
+      const o6 = 6 * j;
+      for (let e = 0; e < 3; e++) {
+        const u = ids[e], v = ids[(e + 1) % 3];
+        if (same(j, 0, u) || same(j, 1, u) || same(j, 0, v) || same(j, 1, v)) continue;
+        crossN(X[3 * u], X[3 * u + 1], X[3 * u + 2], X[3 * v], X[3 * v + 1], X[3 * v + 2]);
+        const s1 = segX[o6] * T[0] + segX[o6 + 1] * T[1] + segX[o6 + 2] * T[2], s2 = segX[o6 + 3] * T[0] + segX[o6 + 4] * T[1] + segX[o6 + 5] * T[2];
+        if (s1 * s2 >= 0) continue;
+        crossN(segX[o6], segX[o6 + 1], segX[o6 + 2], segX[o6 + 3], segX[o6 + 4], segX[o6 + 5]);
+        const t1 = X[3 * u] * T[0] + X[3 * u + 1] * T[1] + X[3 * u + 2] * T[2], t2 = X[3 * v] * T[0] + X[3 * v + 1] * T[1] + X[3 * v + 2] * T[2];
+        if (t1 * t2 < 0) { ok = false; return; }
+      }
+      for (let end = 0; end < 2 && ok; end++) { // boundary vertex strictly inside the triangle
+        if (same(j, end, a) || same(j, end, b) || same(j, end, c)) continue;
+        const px = segX[o6 + 3 * end], py = segX[o6 + 3 * end + 1], pz = segX[o6 + 3 * end + 2];
+        let inside = true;
+        for (let e = 0; e < 3 && inside; e++) {
+          const u = ids[e], v = ids[(e + 1) % 3];
+          crossN(X[3 * u], X[3 * u + 1], X[3 * u + 2], X[3 * v], X[3 * v + 1], X[3 * v + 2]);
+          if (px * T[0] + py * T[1] + pz * T[2] <= 1e-14) inside = false;
+        }
+        if (inside) ok = false;
+      }
+    });
+    if (!ok) return;
+    if (ptP[a] === ptP[b] && ptP[b] === ptP[c]) fills[ptP[a]].push(ptV[a], ptV[b], ptV[c]);
+    else seamP.push(ptP[a], ptP[b], ptP[c]), seamV.push(ptV[a], ptV[b], ptV[c]);
+  }
+  if (nb >= 3) for (const sg of [1, -1]) {
+    const coords = new Float64Array(2 * nb);
+    for (let i = 0; i < nb; i++) { const f = 1 / Math.max(1e-9, 1 - sg * X[3 * i + 2]); coords[2 * i] = X[3 * i] * f; coords[2 * i + 1] = sg * X[3 * i + 1] * f; }
+    const tr = new Delaunator(coords).triangles;
+    for (let t = 0; t < tr.length; t += 3) {
+      const a = tr[t], b = tr[t + 1], c = tr[t + 2], cz = X[3 * a + 2] + X[3 * b + 2] + X[3 * c + 2];
+      if (sg > 0 ? cz > 0 : cz <= 0) continue;          // keep only the hemisphere away from this projection's pole
+      consider(a, b, c);
+    }
+  }
+  W.seam = { P: Int16Array.from(seamP), V: Uint32Array.from(seamV), m: seamP.length / 3 };
+  let changed = false;
+  plates.forEach((pl, p) => {
+    const f = fills[p]; if (!f.length) return;
+    const used = new Set(); for (let i = 0; i < pl.bedge.length; i += 2) used.add(pl.bedge[i] * pl.n + pl.bedge[i + 1]);
+    let added = 0;
+    for (let i = 0; i < f.length; i += 3) {
+      let a = f[i], b = f[i + 1], c = f[i + 2];
+      if (orient(pl.pos, a, b, c) <= 0) { const t = b; b = c; c = t; }
+      // a directed edge may appear in only one triangle: reject fills that would reuse one
+      const ek = [a * pl.n + b, b * pl.n + c, c * pl.n + a];
+      if (used.has(ek[0]) || used.has(ek[1]) || used.has(ek[2])) continue;
+      ek.forEach(x => used.add(x)); added++;
+      addTri(pl, a, b, c);
+      const dA = triArea(pl.pos, a, b, c) * P.R * P.R / 3;
+      addNewFloor(pl, a, dA); addNewFloor(pl, b, dA); addNewFloor(pl, c, dA);
+    }
+    if (!added) return;
+    W.fills += added;
+    extractBoundary(pl); pl.version++; changed = true;
+  });
+  return changed;
+}
+
+// ---------- §11.8 coverage: fraction of probe points covered by no plate (and no seam) / by more than one plate ----------
 function measureCoverage(W) {
   const hash = triangleHash(W), pr = W.probes, np = pr.length / 3, seen = new Int32Array(W.plates.length);
-  let gap = 0, over = 0;
+  const sm = W.seam, sh = new SphereHash(3 * 2.5 * W.s), wp = (j, c) => W.plates[sm.P[j]].wpos[3 * sm.V[j] + c];
+  for (let t = 0; t < sm.m; t++) sh.insert(wp(3 * t, 0) + wp(3 * t + 1, 0) + wp(3 * t + 2, 0), wp(3 * t, 1) + wp(3 * t + 1, 1) + wp(3 * t + 2, 1), wp(3 * t, 2) + wp(3 * t + 1, 2) + wp(3 * t + 2, 2), t);
+  // the hash stores centroids ×3; query with the probe scaled by 3 (cells scale accordingly)
+  let gap = 0, over = 0, seam = 0;
   for (let i = 0; i < np; i++) {
+    const x = pr[3 * i], y = pr[3 * i + 1], z = pr[3 * i + 2];
     let cnt = 0;
-    platesContaining(W, hash, pr[3 * i], pr[3 * i + 1], pr[3 * i + 2], -1, p => { if (seen[p] !== i + 1) { seen[p] = i + 1; cnt++; } });
-    if (cnt === 0) gap++; else if (cnt > 1) over++;
+    platesContaining(W, hash, x, y, z, -1, p => { if (seen[p] !== i + 1) { seen[p] = i + 1; cnt++; } });
+    if (cnt > 1) over++;
+    if (cnt) continue;
+    let inSeam = false;
+    sh.query(3 * x, 3 * y, 3 * z, t => {
+      if (inSeam) return;
+      let ins = true;
+      for (let e = 0; e < 3 && ins; e++) {
+        const u = 3 * t + e, v = 3 * t + (e + 1) % 3;
+        const ux = wp(u, 0), uy = wp(u, 1), uz = wp(u, 2), vx = wp(v, 0), vy = wp(v, 1), vz = wp(v, 2);
+        if (x * (uy * vz - uz * vy) + y * (uz * vx - ux * vz) + z * (ux * vy - uy * vx) < 0) ins = false;
+      }
+      if (ins) inSeam = true;
+    });
+    if (inSeam) seam++; else gap++;
   }
-  W.coverage.gap = gap / np; W.coverage.over = over / np;
+  W.coverage.gap = gap / np; W.coverage.over = over / np; W.coverage.seam = seam / np;
 }
 
 // ---------- time step (§14), M1 subset ----------
@@ -931,6 +1078,7 @@ function step(W, dtMyr) {
     worldPositions(pl);
   }
   contactGeometry(W);
+  if (buildSeams(W)) { contactGeometry(W); buildSeams(W); }
   W.time += dtMyr;
 }
 
@@ -987,7 +1135,7 @@ const exagVal = () => +ui.exag.value;
 let W = null, running = true;
 const plateObjs = [];
 
-function disposeObj(o) { world.remove(o.group); o.mesh.geometry.dispose(); o.mesh.material.dispose(); o.lines.geometry.dispose(); o.lines.material.dispose(); }
+function disposeObj(o) { world.remove(o.group); o.mesh.geometry.dispose(); o.mesh.material.dispose(); o.wire.material.dispose(); o.lines.geometry.dispose(); o.lines.material.dispose(); }
 function buildPlateObject(pl, i) {
   const geom = new THREE.BufferGeometry();
   geom.setAttribute("position", new THREE.BufferAttribute(new Float32Array(3 * pl.n), 3));
@@ -998,8 +1146,11 @@ function buildPlateObject(pl, i) {
   lg.setAttribute("position", new THREE.BufferAttribute(new Float32Array(3 * pl.bedge.length), 3));
   lg.setAttribute("color", new THREE.BufferAttribute(new Float32Array(3 * pl.bedge.length), 3));
   const lines = new THREE.LineSegments(lg, new THREE.LineBasicMaterial({ vertexColors: true, transparent: true, opacity: 0.9 }));
-  const group = new THREE.Group(); group.add(mesh); group.add(lines); world.add(group);
-  return { group, mesh, lines, version: pl.version };
+  // mesh mode: every triangle edge, drawn over the faces in a light tint of the plate's colour
+  const wire = new THREE.Mesh(geom, new THREE.MeshBasicMaterial({ wireframe: true, color: new THREE.Color().setHSL(pl.hue, 0.7, 0.78), transparent: true, opacity: 0.55 }));
+  wire.scale.setScalar(1.0008); wire.visible = false;
+  const group = new THREE.Group(); group.add(mesh); group.add(wire); group.add(lines); world.add(group);
+  return { group, mesh, wire, lines, version: pl.version };
 }
 function buildPlateObjects() {
   for (const o of plateObjs) disposeObj(o);
@@ -1008,9 +1159,48 @@ function buildPlateObjects() {
   refreshGeometry();
 }
 
+// colour of column v of plate pl in the current display mode
+const SEAM_RGB = [0.98, 0.72, 0.30], tmpC = new THREE.Color();
+function columnColour(pl, v, mode, col, o) {
+  if (mode === "elev") MAPS.elev.f(pl.e[v], col, o);
+  else if (mode === "L") MAPS.L.f(pl.L[v], col, o);
+  else if (mode === "hc") MAPS.hc.f(pl.Vc[v] / pl.A[v], col, o);
+  else { tmpC.setHSL(pl.hue, 0.45, mode === "mesh" ? 0.3 : pl.Vc[v] / pl.A[v] > 15e3 ? 0.66 : 0.42); col[o] = tmpC.r; col[o + 1] = tmpC.g; col[o + 2] = tmpC.b; }
+}
+
+// seam faces: owned by no plate, drawn in the world frame from their corner columns
+const seamGeom = new THREE.BufferGeometry();
+let seamCap = 0;
+const seamMesh = new THREE.Mesh(seamGeom, new THREE.MeshLambertMaterial({ vertexColors: true, side: THREE.DoubleSide }));
+const seamWire = new THREE.Mesh(seamGeom, new THREE.MeshBasicMaterial({ wireframe: true, color: 0xffe2b0, transparent: true, opacity: 0.8 }));
+seamWire.scale.setScalar(1.0008);
+world.add(seamMesh); world.add(seamWire);
+function refreshSeams(k, mode) {
+  const sm = W.seam, m = sm ? sm.m : 0;
+  if (3 * m > seamCap) {
+    seamCap = Math.max(3 * m, 2 * seamCap, 3000);
+    seamGeom.setAttribute("position", new THREE.BufferAttribute(new Float32Array(3 * seamCap), 3));
+    seamGeom.setAttribute("color", new THREE.BufferAttribute(new Float32Array(3 * seamCap), 3));
+  }
+  if (!seamCap) return;
+  const pos = seamGeom.attributes.position.array, col = seamGeom.attributes.color.array;
+  for (let j = 0; j < 3 * m; j++) {
+    const pl = W.plates[sm.P[j]], v = sm.V[j], r = 1 + k * pl.e[v];
+    pos[3 * j] = pl.wpos[3 * v] * r; pos[3 * j + 1] = pl.wpos[3 * v + 1] * r; pos[3 * j + 2] = pl.wpos[3 * v + 2] * r;
+    if (mode === "mesh") { col[3 * j] = SEAM_RGB[0]; col[3 * j + 1] = SEAM_RGB[1]; col[3 * j + 2] = SEAM_RGB[2]; }
+    else if (mode === "plate") { col[3 * j] = col[3 * j + 1] = col[3 * j + 2] = 0.85; }
+    else columnColour(pl, v, mode, col, 3 * j);
+  }
+  seamGeom.setDrawRange(0, 3 * m);
+  seamGeom.attributes.position.needsUpdate = true; seamGeom.attributes.color.needsUpdate = true;
+  seamGeom.computeVertexNormals(); seamGeom.computeBoundingSphere();
+  seamWire.visible = mode === "mesh";
+}
+
 function refreshGeometry() {
-  const k = exagVal() / P.R, mode = ui.mode.value, col3 = [0, 0, 0];
+  const k = exagVal() / P.R, mode = ui.mode.value;
   mantle.scale.setScalar(1 + k * -6800);
+  refreshSeams(k, mode);
   W.plates.forEach((pl, i) => {
     if (plateObjs[i].version !== pl.version) { disposeObj(plateObjs[i]); plateObjs[i] = buildPlateObject(pl, i); }
     const o = plateObjs[i];
@@ -1019,11 +1209,9 @@ function refreshGeometry() {
     for (let v = 0; v < pl.n; v++) {
       const r = 1 + k * pl.e[v];
       pos[3 * v] = pl.pos[3 * v] * r; pos[3 * v + 1] = pl.pos[3 * v + 1] * r; pos[3 * v + 2] = pl.pos[3 * v + 2] * r;
-      if (mode === "elev") MAPS.elev.f(pl.e[v], col, 3 * v);
-      else if (mode === "L") MAPS.L.f(pl.L[v], col, 3 * v);
-      else if (mode === "hc") MAPS.hc.f(pl.Vc[v] / pl.A[v], col, 3 * v);
-      else { const c = new THREE.Color().setHSL(pl.hue, 0.45, pl.Vc[v] / pl.A[v] > 15e3 ? 0.66 : 0.42); col[3 * v] = c.r; col[3 * v + 1] = c.g; col[3 * v + 2] = c.b; }
+      columnColour(pl, v, mode, col, 3 * v);
     }
+    o.wire.visible = mode === "mesh";
     pa.needsUpdate = true; ca.needsUpdate = true;
     o.mesh.geometry.computeVertexNormals(); o.mesh.geometry.computeBoundingSphere();
     o.lines.visible = ui.bounds.checked;
@@ -1047,14 +1235,17 @@ function updateReadout() {
   for (const pl of W.plates) { n += pl.n; for (let v = 0; v < pl.n; v++) { tot += pl.A[v]; if (pl.e[v] > 0) land += pl.A[v]; } }
   document.getElementById("r-cols").textContent = n.toLocaleString();
   document.getElementById("r-land").textContent = (100 * land / tot).toFixed(1) + " %";
-  document.getElementById("r-gap").textContent = (100 * W.coverage.gap).toFixed(1) + " %";
   document.getElementById("r-over").textContent = (100 * W.coverage.over).toFixed(1) + " %";
+  document.getElementById("r-seam").textContent = (100 * W.coverage.seam).toFixed(2) + " %";
+  document.getElementById("r-fills").textContent = W.fills.toLocaleString();
+  document.getElementById("r-gap").textContent = (100 * W.coverage.gap).toFixed(2) + " %";
   const tl = W.blen.reduce((a, b) => a + b, 0) || 1;
   document.querySelectorAll("#mix i").forEach((el, c) => { el.style.flexGrow = W.blen[c] / tl; });
   document.querySelectorAll("#mix-key b").forEach((el, c) => { el.textContent = Math.round(100 * W.blen[c] / tl) + "%"; });
 }
 
 function drawLegend() {
+  document.getElementById("mesh-note").hidden = ui.mode.value !== "mesh";
   const m = MAPS[ui.mode.value], lg = document.getElementById("legend");
   lg.hidden = !m; if (!m) return;
   const c = document.getElementById("legend-bar"), ctx = c.getContext("2d"), img = ctx.createImageData(256, 1), tmp = [0, 0, 0];
@@ -1136,5 +1327,5 @@ function loop() {
 }
 
 syncLabels(); drawLegend(); resize(); reset(); loop();
-window.__pp = { get W() { return W; }, step: n => { for (let i = 0; i < n; i++) step(W, dtVal()); refreshGeometry(); updateReadout(); }, measureCoverage };
+window.__pp = { get W() { return W; }, focus: (x, y, z) => { world.quaternion.setFromUnitVectors(new THREE.Vector3(x, y, z).normalize(), new THREE.Vector3(0, 0, 1)); }, step: n => { for (let i = 0; i < n; i++) step(W, dtVal()); refreshGeometry(); updateReadout(); }, measureCoverage };
 </script>

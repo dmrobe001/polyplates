@@ -12,6 +12,7 @@ prescribed behaviour with emergent behaviour.
 |---|-----------|---------------|----------------------|--------|
 | 0 | **Kinematic scaffold** | §2, §3, §4, §6 (isostasy), §12 (L only) | Separate plate meshes on prescribed Euler-pole rotations; per-column state; isostatic elevation; thickening of L with age; gaps open, overlaps pile up | **done** (v0.1) |
 | 1 | **Contact geometry and spreading** | §11.1, §11.2 gap case, §11.3, §11.8 | Spatial index over boundary segments on the sphere; signed gap, v_n, v_t per boundary vertex; new strips of young plate fill gaps; boundary edge splitting; coverage metric shown in the panel | **done** (v0.2) |
+| 1.5 | **Seams** | §11.2–11.3, §11.8 | Gaps between plates are covered by seam faces (owned by no plate) rebuilt each step; plates grow to the seam midline when it widens; cracks within a plate are filled; mesh display mode | **done** (v0.3) |
 | 2 | **Overlap resolution: subduction and welding (kinematic)** | §11.4 initiation and welding, §11.5 (minus forces), §11.6 termination | Columns flagged ς=1 under the overriding plate; slab kept and deleted at d_max; felsic crust scraped and accreted; arc crust and hydration; collisions weld plates. Motions still prescribed | |
 | 3 | **Rigid-plate torque balance** | §6 GPE, §11.5 forces, §11.4 friction, §13 (Eqs. bc, drag), §14 rigid limit | Plate angular velocities solved each step from slab pull, ridge push (Γ), basal drag, interface and transform friction. First milestone where motion is emergent. Mantle model stub supplies u^m and Υ | |
 | 4 | **Strength profiles** | §7, §8, §9 | Per-column quadrature of F_b, F_d, H_e, T_e (GPU-friendly, one thread per column); display layers for them; closed-form checks of §9 run as a self-test | |
@@ -33,6 +34,47 @@ prescribed behaviour with emergent behaviour.
   "crustal density = rock type" proxy will need a two-layer crust or a calibrated mean.
 - **Sea level.** The spec fixes sea level at z = 0. For generated worlds, land fraction is a key output,
   so sea level should probably come from a conserved ocean volume (milestone 7, possibly earlier).
+
+## v0.3 (milestone 1.5) seams
+
+Motivation: in v0.2 a gap counted as real only once it was wider than Δx_acc, so cracks narrower than that
+stayed open indefinitely. The fix inverts the logic: the gap is always triangulated, and Δx_acc only decides
+when to add vertices.
+
+What is done:
+- **Seams.** A seam is the plate-boundary zone itself: triangles whose corners belong to two or three plates.
+  They carry no state, have no strength and add no area to any column; they are drawn with colours taken
+  from their corner columns, so a ridge reads as continuous young sea floor.
+- **Rebuilt every step, not stored.** All boundary vertices of all plates are Delaunay-triangulated (two
+  stereographic projections, each used only in the hemisphere away from its pole). A triangle is kept if
+  it is short (edges ≤ 2.2 s), has non-trivial area, lies in uncovered space (centroid, and the midpoints of
+  edges that are not existing boundary edges), crosses no plate boundary and contains no boundary vertex.
+  Because the seam is recomputed, sliding (transform) boundaries never shear it into slivers, and triple
+  junctions get three-plate faces with no special case.
+- **Crack fills.** A kept triangle whose three corners are on the same plate is a crack in a rigid plate,
+  which can never widen; it is added to the plate permanently as new sea floor (§3 mixing rule). A
+  triangle may not reuse a directed edge its plate already has.
+- **Midline split rule.** When the gap at a boundary vertex exceeds Δx_acc (≈ 1 s), the plate grows a new
+  vertex at the midpoint between that vertex and its facing point on the other plate; both plates aim at
+  the same midline, and the seam between the two new copies starts at near-zero width. Where no plate
+  faces the vertex within reach, growth falls back to the outward normal.
+- **Classification.** "Open gap" now means no facing plate within reach. Otherwise a boundary is named
+  by its relative motion (spreading, transform, convergent), or overlap if it lies inside another plate.
+- **Display.** A "Mesh" colour mode draws every triangle, with faces and edges in the plate's colour and
+  seam faces in amber. The panel reports seam area and the count of crack fills.
+
+Results (seed 1, 11.5k vertices, 0.5 Myr steps): the uncovered fraction stays at 0.03–0.1 % through 150 Myr
+(v0.2: about 2 %), seams cover about 1.5–2 % of the sphere, with no edge used by more than two triangles,
+no inverted triangles and no folds. A step costs about 50 ms on the test container (v0.2: about 30 ms);
+the seam triangulation is the added cost.
+
+What was learned:
+- **The seam should belong to no plate.** Assigning each seam face to the plate owning two of its corners would
+  make plate meshes non-rigid (bad for the rigid torque balance of milestone 3) and would need continuous
+  crust bookkeeping as faces stretch and change owner.
+- **A bug worth recording:** the point-in-plate query hashes the query point, so it must be on the unit sphere.
+  Passing an unnormalised centroid (a sum of three vertices) silently made almost everything look
+  uncovered, which produced duplicate triangles and, downstream, folds and inverted triangles.
 
 ## v0.2 (milestone 1) implementation notes
 
