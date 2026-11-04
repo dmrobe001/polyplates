@@ -70,6 +70,27 @@ What is done:
   Surface pieces smaller than 1.5 mean column areas, stranded by removal, are dropped and their crust is
   handed to the nearest surviving column.
 
+Fixed in v0.4.1 (slab patches far from any visible plate edge):
+- **Subduction polarity was decided column by column**, so where two oceanic plates of similar age met, the
+  choice flipped back and forth along one boundary. The plates interlocked, leaving slab patches and islands
+  inside each other: 80 % (seed 1) and 50 % (seed 2) of slab columns had slab of the opposite polarity within
+  3 spacings. Polarity is now coherent over a radius of 3 s, as the spec intends ("along the contiguous stretch",
+  "overlap with slab" persists):
+  - if slab between the two plates already exists nearby, the plate already going under keeps going under;
+  - otherwise the plate with lower mean buoyancy in that radius goes under;
+  - near-ties (|ΔB| < 0.5×10⁶ kg/m²) are broken the same way from both sides;
+  - if the plate that should go under is buoyant and the other side can sink, the other side goes under
+    (subduction flip).
+  Local mixing fell to 20 %, 9 % and 5.5 % (seeds 1–3). About 80 % of what remains is next to continental
+  crust, where patchy margin buoyancy produces legitimate but patchy flips.
+- **Welding left third-party slabs pointing at the absorbed plate.** They are now re-pointed to the merged plate.
+- **Slab pieces cut off from any trench** are deleted (break-off).
+- **The slab overlay drew the unfolded slab.** A column at down-dip distance d was drawn d from the trench,
+  up to 933 km into the overriding plate. It is now drawn at d·cos θ_d from the trench point it hangs from
+  (≤ 660 km), coloured red at the trench to violet at depth. After these fixes 95–99 % of slab columns hang
+  from a trench within 2 spacings of the edge of the plate they are under, and 84–93 % of footprints lie
+  under that plate; the rest belong to overriding plates that have since moved away.
+
 Added outside the spec (to revisit):
 - **Crustal flow as a stand-in for gravitational collapse.** Without deformable plates, collision and arc
   growth thickened single columns without limit (196 km crust and 24 km elevations in testing). Crust
