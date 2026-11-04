@@ -1,0 +1,1099 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{siunitx}
+\usepackage[hidelinks]{hyperref}
+
+\sisetup{per-mode=symbol}
+
+\newcommand{\dd}{\,\mathrm{d}}
+\newcommand{\mac}[1]{\left\langle #1 \right\rangle}
+\newcommand{\inv}[1]{\left| #1 \right|}
+\newcommand{\Tk}{\tilde{T}}
+\newcommand{\NN}{\mathcal{N}}
+
+\title{A multi-plate, depth-integrated elasto-viscoplastic model\\
+of the lithosphere with emergent plate boundaries}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We describe a reduced model of plate tectonics on a sphere. Each tectonic plate
+is a separate triangulated surface mesh whose vertices carry vertical columns of
+lithosphere. A column is described by a small state: crustal volume, reference
+densities of crust and lithospheric mantle (used as a proxy for rock type), the
+thermal thickness of the plate, a hydration index, a damage index, a
+depth-integrated stress resultant, and a flag recording whether the column has
+been subducted. From this state, depth profiles of temperature, density, and
+strength are reconstructed and integrated to give a constitutive law for each
+column: a Maxwell elastic element in series with a Herschel--Bulkley
+viscoplastic element, weakened by a thixotropic damage variable. Plates interact
+only through their boundaries, which are not conforming: plates may separate,
+overlap, or slide past one another. Spreading, subduction, transform faulting,
+collision, and rifting are not prescribed as boundary labels but follow from
+the local geometry of gaps, overlaps, and sliding, together with the state of
+the columns on either side. Subducted columns are retained beneath the
+overriding plate as a slab, from which slab pull, interface friction, and arc
+processes are computed. Convection in the underlying mantle is supplied by a
+separate model as a velocity field and an upwelling rate at the base of the
+plates.
+\end{abstract}
+
+\tableofcontents
+
+%======================================================================
+\section{Overview}
+%======================================================================
+
+The lithosphere is treated as a collection of thin sheets in the sense of
+England and McKenzie~\cite{EnglandMcKenzie1982}: horizontal length scales are
+large compared with plate thickness, horizontal velocity is uniform with depth
+within a column, vertical normal stress is lithostatic, and mechanical response
+is described by depth-integrated stress resultants (force per unit length). A
+plate is defined kinematically as the material that moves coherently with the
+surface; its base is identified with a characteristic isotherm $T_L$.
+
+The model has five layers of description:
+\begin{enumerate}
+  \item \emph{State}, stored per column (Section~\ref{sec:state}).
+  \item \emph{Reconstructed depth profiles} of temperature, density, and
+        strength, computed from the state through closure relations
+        (Sections~\ref{sec:thermal}--\ref{sec:strength}).
+  \item \emph{Depth-integrated column properties}
+        (Section~\ref{sec:integrated}).
+  \item \emph{Plate-interior field equations}: constitutive law, damage
+        evolution, and force balance
+        (Sections~\ref{sec:constitutive}, \ref{sec:damage},
+        \ref{sec:forcebalance}).
+  \item \emph{Boundary interactions} between plates, including the creation and
+        destruction of plate area and changes in plate topology
+        (Section~\ref{sec:boundaries}).
+\end{enumerate}
+Quantities in layers 2 and 3, and all properties of plate boundaries, are
+recomputed from the state when needed rather than stored.
+
+%======================================================================
+\section{Geometry, coordinates, and notation}
+%======================================================================
+
+\paragraph{Plates and columns.}
+The surface of a sphere of radius $R_\oplus$ is covered by a set of plates
+$\{\Omega_p\}$. Each plate is a triangulated mesh. Each vertex $v$ of a plate
+mesh represents a vertical column of lithosphere occupying the vertex's dual
+cell, of area $A_v$ (one third of the area of each incident triangle).
+Triangles are used to evaluate horizontal gradients; columns carry the state.
+Each plate's mesh has one or more boundary loops, which are ordered polylines of
+boundary vertices.
+
+\paragraph{Coordinates.}
+At each point, $x_i$ ($i\in\{1,2\}$) are Cartesian coordinates in the local
+tangent plane, with summation over repeated horizontal indices. Two vertical
+coordinates are used: $z$, depth below sea level, and $\zeta$, depth below the
+local solid surface, both positive downward. If $e$ is the elevation of the
+solid surface above sea level, then $z = \zeta - e$. On a plate boundary, $n_i$
+is the outward unit normal of the plate in the tangent plane and $s_i$ the unit
+tangent.
+
+\paragraph{Fields and operators.}
+Temperatures written $T$ are in degrees Celsius; the same temperature in kelvin
+is $\Tk = T + 273.15$. Horizontal velocity is $u_i$, and
+$\mathrm{D}/\mathrm{D}t = \partial_t + u_j\partial_j$ is the material
+derivative. The strain-rate and spin tensors are
+\begin{equation}
+  \dot\varepsilon_{ij} = \tfrac12\left(\partial_i u_j + \partial_j u_i\right),
+  \qquad
+  W_{ij} = \tfrac12\left(\partial_i u_j - \partial_j u_i\right).
+\end{equation}
+For a symmetric horizontal tensor $A_{ij}$,
+\begin{equation}
+  \inv{A} = \left(A_{11}^2 + A_{22}^2 + A_{11}A_{22} + A_{12}^2\right)^{1/2}
+  \label{eq:invariant}
+\end{equation}
+is the second invariant $\left(\tfrac12 a_{pq}a_{pq}\right)^{1/2}$ of the
+traceless three-dimensional tensor whose horizontal block is $A$ and whose
+vertical component is $-A_{kk}$; it is the natural invariant for an
+incompressible thin sheet. We write $\dot\varepsilon_{II} =
+\inv{\dot\varepsilon}$. The Macaulay bracket is $\mac{x} = \max(x,0)$, and
+$\operatorname{clamp}(x,a,b) = \min(\max(x,a),b)$.
+
+\paragraph{Regularized direction.}
+For a velocity vector $a_i$ we write
+$\hat a_i = a_i / \sqrt{a_k a_k + v_{\mathrm{reg}}^2}$, a unit vector
+regularized at small speeds by $v_{\mathrm{reg}}$, used wherever frictional
+forces oppose relative motion.
+
+%======================================================================
+\section{State}
+\label{sec:state}
+%======================================================================
+
+Each column carries the state in Table~\ref{tab:state}. Membership of a column
+in a plate is given by the mesh it belongs to.
+
+\begin{table}[h]
+\centering
+\caption{Per-column state.}
+\label{tab:state}
+\begin{tabular}{@{}lp{7.2cm}lp{3.0cm}@{}}
+\toprule
+Symbol & Meaning & Units & Character \\
+\midrule
+$V_c$ & crustal volume of the column & \si{\cubic\metre} & conserved, transferable \\
+$\rho_{0,c}$ & reference density of crust at $T_0$, $P=0$ (rock-type proxy) & \si{\kilo\gram\per\cubic\metre} & material attribute \\
+$\rho_{0,m}$ & reference density of lithospheric mantle at $T_0$, $P=0$ & \si{\kilo\gram\per\cubic\metre} & material attribute \\
+$L$ & thermal thickness of the plate (depth of the $T_L$ isotherm) & \si{\metre} & strained, thermally evolving \\
+$w$ & hydration index, $0 \le w \le 1$ & -- & advected, with sources \\
+$D$ & damage index, $0 \le D \le 1$ & -- & evolving \\
+$T_{ij}$ & depth-integrated deviatoric stress resultant & \si{\newton\per\metre} & evolving \\
+$\varsigma$ & subduction flag, $\varsigma\in\{0,1\}$ & -- & set once \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Crustal thickness is derived, $h_c = V_c / A_v$, so that horizontal shortening
+of a column thickens its crust without a separate rule, and crustal mass is
+conserved by construction. The plate is divided into two layers indexed by
+$k\in\{c,m\}$: crust, $0 \le \zeta < h_c$, and lithospheric mantle,
+$h_c \le \zeta < L$, with $h_c < L$.
+
+The subduction flag is the one piece of state that exists only because plates
+overlap. A column with $\varsigma = 1$ has passed beneath another plate at a
+trench; it no longer takes part in the surface force balance but is retained as
+part of a slab (Section~\ref{sec:convergent}). Its other state variables are
+frozen at their values on subduction. The flag records which of two overlapping
+plates is underneath, which cannot be recovered from geometry alone.
+
+\paragraph{Mixing rule.}
+When crust is transferred between columns (by accretion at a trench, arc
+magmatism, or conservative remapping after remeshing), volumes add and the
+reference density of the receiving column becomes the volume-weighted mean of
+the combined crust. Intensive mantle attributes are averaged weighted by column
+area.
+
+%======================================================================
+\section{Thermal structure}
+\label{sec:thermal}
+%======================================================================
+
+Within a column the temperature is linear in depth:
+\begin{equation}
+  T(\zeta) = T_s + G\,\zeta, \qquad
+  G = \frac{T_L - T_s}{L}, \qquad 0 \le \zeta \le L,
+  \label{eq:geotherm}
+\end{equation}
+where $T_s$ is the surface temperature and $G$ the thermal gradient. Because
+$T_s$ and $T_L$ are global constants, the thermal state of a column is fully
+described by $L$. Below the plate, the convecting mantle follows an adiabat
+$T_a(z) = T_p + \gamma_{\mathrm{ad}}\,z$ with potential temperature $T_p$ and
+adiabatic gradient $\gamma_{\mathrm{ad}}$. The small mismatch between $T_L$ and
+$T_a$ at the plate base is neglected.
+
+%======================================================================
+\section{Rock-property closure}
+\label{sec:closure}
+%======================================================================
+
+Each layer $k$ has a brittle--ductile transition temperature $T_{bd,k}$ and a
+creep activation energy $Q_k$, obtained by piecewise-linear interpolation in
+$\rho_{0,k}$ through anchor points $\{(\rho^{(a)}, T_{bd}^{(a)}, Q^{(a)})\}$
+(Table~\ref{tab:anchors}), with constant extrapolation outside the anchored
+range. With interpolants $\mathcal{T}(\rho_0)$ and $\mathcal{Q}(\rho_0)$,
+\begin{equation}
+  T_{bd,k} = \mathcal{T}(\rho_{0,k}) - \Delta T_w\, w,
+  \qquad
+  Q_k = \mathcal{Q}(\rho_{0,k}).
+  \label{eq:Tbd}
+\end{equation}
+Hydration lowers the transition temperature by up to $\Delta T_w$, and raises the
+pore-fluid pressure ratio (pore pressure divided by lithostatic pressure):
+\begin{equation}
+  \lambda(w) = \lambda_0 + (\lambda_1 - \lambda_0)\, w,
+  \label{eq:lambda}
+\end{equation}
+where $\lambda_0$ corresponds to a hydrostatic fluid column and $\lambda_1$ to a
+strongly overpressured one.
+
+\begin{table}[h]
+\centering
+\caption{Anchor points for the rock-property closure. Transition temperatures
+are for the reference strain rate $\dot\varepsilon_{\mathrm{ref}}$ under
+compression. Activation energies follow laboratory flow laws for wet quartzite
+\cite{GleasonTullis1995}, dry diabase \cite{Mackwell1998}, and dry olivine
+\cite{HirthKohlstedt2003}.}
+\label{tab:anchors}
+\begin{tabular}{@{}lccc@{}}
+\toprule
+Representative rock & $\rho^{(a)}$ (\si{\kilo\gram\per\cubic\metre}) & $T_{bd}^{(a)}$ (\si{\celsius}) & $Q^{(a)}$ (\si{\kilo\joule\per\mole}) \\
+\midrule
+felsic (quartz-dominated) & 2700 & 300 & 223 \\
+mafic (diabase, granulite) & 2950 & 600 & 485 \\
+ultramafic (olivine) & 3250 & 750 & 530 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Within the mantle, compositional depletion lowers $\rho_{0,m}$ without weakening
+the rock; the strength of depleted mantle is represented through low hydration.
+Densities between the mafic and ultramafic anchors have little physical meaning
+and should not arise in practice.
+
+%======================================================================
+\section{Density, buoyancy, isostasy, and gravitational potential energy}
+\label{sec:density}
+%======================================================================
+
+Density within layer $k$ of a column and within the asthenosphere are
+\begin{equation}
+  \rho_k(\zeta) = \rho_{0,k}\left[1 - \alpha\left(T(\zeta) - T_0\right)\right],
+  \qquad
+  \rho_a(z) = \rho_{a,0}\left[1 - \alpha\left(T_a(z) - T_0\right)\right],
+\end{equation}
+where $\alpha$ is the thermal expansion coefficient, $T_0$ the reference
+temperature at which reference densities are specified, and $\rho_{a,0}$ the
+reference density of undepleted asthenospheric mantle. Compressibility is
+neglected, since it is nearly common to all columns.
+
+\paragraph{Column buoyancy.}
+The net buoyancy of a column per unit area, relative to asthenosphere at the
+same depth below its surface, is
+\begin{equation}
+  B = \int_0^{L} \left[\rho_a(\zeta) - \rho(\zeta)\right] \dd\zeta,
+  \label{eq:buoyancy}
+\end{equation}
+where $\rho(\zeta)$ is $\rho_c$ or $\rho_m$ according to layer. Positive $B$
+indicates a column lighter than the mantle it displaces; continental columns
+have $B > 0$ and old oceanic columns $B < 0$. Buoyancy decides which plate
+subducts at a convergent boundary and when subduction must stop.
+
+\paragraph{Isostatic elevation.}
+For a compensation depth $z_c$ below the deepest plate base, the mass per unit
+area above $z_c$ for a column with surface elevation $e$ is
+\begin{equation}
+  M(e) = \rho_w \mac{-e}
+  + \int_{-e}^{-e+h_c} \rho_c \dd z
+  + \int_{-e+h_c}^{-e+L} \rho_m \dd z
+  + \int_{-e+L}^{z_c} \rho_a(z) \dd z,
+\end{equation}
+where $\rho_w$ is seawater density. Local isostasy requires
+$M(e) = M_{\mathrm{ref}}$, with $M_{\mathrm{ref}}$ fixed by a reference column
+of known elevation $e_{\mathrm{ref}}$. Since $\mathrm{d}M/\mathrm{d}e > 0$, the
+root is unique.
+
+\paragraph{Pressure and gravitational potential energy.}
+With $z_{\mathrm{top}} = \min(0,-e)$,
+\begin{equation}
+  P(z) = g \int_{z_{\mathrm{top}}}^{z} \rho(z')\dd z',
+  \qquad
+  \Gamma = \int_{z_{\mathrm{top}}}^{z_c} P(z)\dd z - \Gamma_{\mathrm{ref}},
+  \label{eq:GPE}
+\end{equation}
+where $g$ is gravitational acceleration and $\Gamma$ is the gravitational
+potential energy per unit area, measured relative to that of the reference
+column, $\Gamma_{\mathrm{ref}}$. Subtracting the constant reduces round-off,
+since only differences of $\Gamma$ affect the dynamics. We write
+$P_s(\zeta) = P(\zeta - e)$ for pressure as a function of depth below the solid
+surface. $\Gamma_0$ denotes the value of $\Gamma$ for a newly formed column
+(Section~\ref{sec:spreading}).
+
+%======================================================================
+\section{Strength profile}
+\label{sec:strength}
+%======================================================================
+
+The strength of a column at depth $\zeta$ is the differential stress
+$\sigma = \sigma_1 - \sigma_3$ it can sustain at the reference strain rate
+$\dot\varepsilon_{\mathrm{ref}}$.
+
+\paragraph{Frictional strength.}
+Frictional sliding on optimally oriented faults with friction coefficient
+$\mu_f$ \cite{Byerlee1978} limits the differential stress to
+\begin{equation}
+  \sigma_b(\zeta;\chi) = \beta(\chi)\,\big(1-\lambda(w)\big)\,P_s(\zeta).
+  \label{eq:brittle}
+\end{equation}
+With $R = (\sqrt{1+\mu_f^2}+\mu_f)^2$, the coefficients for thrust, strike-slip,
+and normal faulting are
+\begin{equation}
+  \beta_c = R - 1, \qquad
+  \beta_s = \frac{2(R-1)}{R+1}, \qquad
+  \beta_e = 1 - \frac{1}{R},
+\end{equation}
+approximately $2.12$, $1.03$, and $0.68$ for $\mu_f = 0.6$. The deformation mode
+is read from the stress resultant,
+\begin{equation}
+  \chi = \frac{T_{kk}}{\sqrt3\,\inv{T}} \in [-1,1]
+  \qquad (\chi = 0 \text{ if } \inv{T}=0),
+  \label{eq:chi}
+\end{equation}
+negative in horizontal compression and positive in horizontal tension (tension
+positive), and
+\begin{equation}
+  \beta(\chi) =
+  \begin{cases}
+    \beta_s + (\beta_s - \beta_c)\,\chi, & \chi < 0,\\
+    \beta_s + (\beta_e - \beta_s)\,\chi, & \chi \ge 0.
+  \end{cases}
+\end{equation}
+
+\paragraph{Creep strength.}
+Power-law creep, $\dot\varepsilon = A\,\sigma^n\exp(-Q/R_g\Tk)$, is anchored at
+the depth of the brittle--ductile transition of layer $k$,
+$\zeta_{bd,k} = (T_{bd,k} - T_s)/G$, where it is required to equal the
+compressional frictional strength under hydrostatic pore pressure:
+\begin{equation}
+  \sigma_{d,k}(\zeta) = \sigma^*_k
+  \exp\!\left[\frac{Q_k}{n R_g}\left(\frac{1}{\Tk(\zeta)} - \frac{1}{\Tk_{bd,k}}\right)\right],
+  \qquad
+  \sigma^*_k = \beta_c(1-\lambda_0)\,P_s(\zeta_{bd,k}),
+  \label{eq:ductile}
+\end{equation}
+with stress exponent $n$ and gas constant $R_g$. This replaces the
+pre-exponential factor $A$ by the more intuitive $T_{bd,k}$. The anchor uses
+$\lambda_0$ so that pore pressure acts only on frictional strength. If
+$\zeta_{bd,k}$ lies outside the layer it still serves as the anchor. At other
+strain rates, creep strength scales as
+$(\dot\varepsilon/\dot\varepsilon_{\mathrm{ref}})^{1/n}$.
+
+\paragraph{Low-temperature plasticity and damage.}
+A cap $\sigma_{\max}$ represents low-temperature plasticity. Damage weakens the
+frictional and plastic limbs by $(1-a_bD)$ and the creep limb by $(1-a_dD)$.
+
+\paragraph{Composite profile.}
+For $\zeta$ in layer $k$,
+\begin{equation}
+  \sigma(\zeta) = \min\Big\{
+    (1-a_bD)\,\sigma_b(\zeta;\chi),\;
+    (1-a_dD)\,\sigma_{d,k}(\zeta),\;
+    (1-a_bD)\,\sigma_{\max}
+  \Big\}.
+  \label{eq:envelope}
+\end{equation}
+Let $\mathcal{B}$ be the set of depths in $[0,L)$ where the frictional or plastic
+limb is the minimum, and $\mathcal{V}$ where the creep limb is.
+
+%======================================================================
+\section{Depth-integrated column properties}
+\label{sec:integrated}
+%======================================================================
+
+\paragraph{Yield and creep resultants.}
+\begin{equation}
+  F_b(\chi) = \kappa_\sigma \int_{\mathcal{B}} \sigma\dd\zeta,
+  \qquad
+  F_d(\chi) = \kappa_\sigma \int_{\mathcal{V}} \sigma\dd\zeta,
+  \label{eq:resultants}
+\end{equation}
+where $\kappa_\sigma \in [\tfrac12, 1/\sqrt3]$ converts differential stress to
+the invariant of Eq.~\eqref{eq:invariant}. $F_b$ is the rate-independent yield
+resultant and $F_d$ the creep resultant at $\dot\varepsilon_{\mathrm{ref}}$. The
+integrals are evaluated by quadrature.
+
+\paragraph{Elastic thickness and flexural rigidity.}
+Let $\mathcal{S} = \{\zeta\in[0,L): \sigma(\zeta)\ge\sigma_{\mathrm{thr}}\}$, and
+let $\ell_1,\dots,\ell_q$ be the lengths of its maximal connected intervals.
+Following Burov and Diament~\cite{BurovDiament1995},
+\begin{equation}
+  H_e = \sum_p \ell_p,
+  \qquad
+  T_e = \Big(\sum_p \ell_p^3\Big)^{1/3},
+  \qquad
+  D_f = \frac{E\,T_e^3}{12(1-\nu^2)},
+\end{equation}
+the membrane elastic thickness, the effective elastic thickness for bending, and
+the flexural rigidity, with Young's modulus $E$ and Poisson's ratio $\nu$.
+Mechanically separated strong layers bend independently and combine as a sum of
+cubes. $D_f$ is needed only if flexure is included; otherwise vertical position
+follows local isostasy.
+
+\paragraph{Closed-form approximation.}
+For one layer of uniform density $\bar\rho$ with no damage, no cap, and thrust
+faulting, let $k_B = \beta_c(1-\lambda)\bar\rho g$ and linearize the Arrhenius
+term about $\Tk_{bd}$. Creep strength then decays below $\zeta_{bd}$ with
+e-folding depth $\delta = nR_g\Tk_{bd}^{\,2}/(Q\,G)$, and
+\begin{equation}
+  F_b \approx \tfrac12\kappa_\sigma k_B\zeta_{bd}^2,
+  \qquad
+  F_d \approx \kappa_\sigma k_B\zeta_{bd}\,\delta
+  \left(1 - e^{-(L-\zeta_{bd})/\delta}\right),
+  \qquad
+  H_e \approx \zeta_{bd} + \delta\ln\frac{k_B\zeta_{bd}}{\sigma_{\mathrm{thr}}}.
+\end{equation}
+For mantle with $G\approx\SI{13}{\kelvin\per\kilo\metre}$, $\delta\approx
+\SI{4}{\kilo\metre}$; for quartz-rich crust with
+$G\approx\SI{18}{\kelvin\per\kilo\metre}$, $\delta\approx\SI{3}{\kilo\metre}$.
+These expressions serve as checks on the quadrature.
+
+%======================================================================
+\section{Constitutive law}
+\label{sec:constitutive}
+%======================================================================
+
+The stress resultant is $T_{ij} = \int_0^L \tau_{ij}\dd\zeta$, where $\tau_{ij}$
+is the horizontal block of the deviatoric stress. Each column behaves as an
+elastic element in series with a viscoplastic element:
+\begin{equation}
+  \dot\varepsilon_{ij}
+  = \frac{1}{2G_sH_e}\frac{\mathcal{D}T_{ij}}{\mathcal{D}t}
+  + \Phi\!\left(\inv{T}\right)\frac{T_{ij}}{\inv{T}},
+  \qquad
+  \Phi\!\left(\inv{T}\right) = \dot\varepsilon_{\mathrm{ref}}
+  \mac{\frac{\inv{T} - F_b(\chi)}{F_d(\chi)}}^{n},
+  \label{eq:evp}
+\end{equation}
+where $G_s$ is the elastic shear modulus and
+\begin{equation}
+  \frac{\mathcal{D}T_{ij}}{\mathcal{D}t}
+  = \frac{\mathrm{D}T_{ij}}{\mathrm{D}t} - W_{ik}T_{kj} + T_{ik}W_{kj}
+\end{equation}
+is the co-rotational (Jaumann) derivative; on the sphere, $T_{ij}$ is also
+parallel-transported between tangent planes. The viscoplastic strain rate has
+invariant $\Phi$. Below the yield resultant the column is elastic; above it, it
+flows as a depth-integrated Herschel--Bulkley material. This is an
+elasto-viscoplastic law of the type of Saramito~\cite{Saramito2009}. For
+implementation the viscoplastic part may be written
+$T_{ij} = 2\bar\eta\,\dot\varepsilon^{vp}_{ij}$ with
+$\bar\eta = \inv{T}/(2\Phi)$, regularized near yield by a small background
+viscosity.
+
+The limit $F_b\to0$, $H_e\to\infty$ is the power-law thin viscous sheet
+\cite{EnglandMcKenzie1982}; the limit $F_b, F_d, H_e \to \infty$ is a rigid
+plate (Section~\ref{sec:solution}). The partition into $\mathcal{B}$ and
+$\mathcal{V}$ is evaluated at $\dot\varepsilon_{\mathrm{ref}}$ and held fixed,
+an approximation justified by the weak dependence of creep strength on strain
+rate ($\propto\dot\varepsilon^{1/n}$).
+
+%======================================================================
+\section{Damage}
+\label{sec:damage}
+%======================================================================
+
+Damage is a structural variable that is broken down by deformation and rebuilt
+by healing, as in models of thixotropic fluids; geologically it represents fault
+weakening and grain-size reduction \cite{BercoviciRicard2012}. For unsubducted
+columns,
+\begin{equation}
+  \frac{\mathrm{D}D}{\mathrm{D}t}
+  = k_D\,\Phi\,(1-D)
+  - \frac{D}{\tau_h}
+  + \partial_i\!\left(\ell_D^2\,k_D\,\Phi\,\partial_i D\right)
+  + S_D^{\Upsilon},
+  \label{eq:damage}
+\end{equation}
+with $D$ clamped to $[0,1]$. The terms are, in order: breakdown in proportion to
+viscoplastic strain rate, with $k_D$ the damage per unit strain; healing with
+time scale
+\begin{equation}
+  \tau_h = \tau_{h,0}\exp\!\left[\frac{Q_h}{R_g}\left(\frac{1}{\Tk_h}-\frac{1}{\Tk_{h,0}}\right)\right],
+  \qquad T_h = T_s + G\,\zeta_h,
+\end{equation}
+evaluated at a representative depth $\zeta_h$ in the strong part of the plate;
+diffusion active only where the column is deforming, which sets the width of
+shear zones to the physical length $\ell_D$ rather than the mesh spacing and
+prevents damage in inactive regions from spreading; and a source from mantle
+upwelling, defined in Section~\ref{sec:rifting}. Damage diffusion acts within a
+plate and has no flux across plate boundaries.
+
+%======================================================================
+\section{Plate boundaries}
+\label{sec:boundaries}
+%======================================================================
+
+Plate boundaries are not conforming. Each plate's boundary vertices move with
+that plate, so neighbouring plates may separate (leaving a gap), overlap, or
+slide. The kind of boundary at any point is not a stored label; it follows from
+the local geometry and from the state of the columns on either side, as follows.
+
+%----------------------------------------------------------------------
+\subsection{Contact geometry}
+%----------------------------------------------------------------------
+
+For each boundary vertex $b$ of plate $p$, the nearest boundary segment of any
+other plate $q$ is found with a global spatial index. The signed gap $g_b$ is
+the distance from $b$ to that segment, positive if $b$ lies outside $\Omega_q$
+and negative if inside. The relative velocity is
+$\Delta u_i = u_i^{(p)} - u_i^{(q)}$ evaluated at $b$ and at its projection onto
+$q$, with normal and tangential components
+\begin{equation}
+  v_n = \Delta u_i n_i, \qquad v_t = \Delta u_i s_i,
+\end{equation}
+where $n_i$ is the outward normal of $p$. Thus $v_n > 0$ is convergence and
+$v_n < 0$ divergence. Boundary vertices are said to be in contact when
+$|g_b| \le g_{\mathrm{tol}}$.
+
+%----------------------------------------------------------------------
+\subsection{Classification}
+\label{sec:classification}
+%----------------------------------------------------------------------
+
+At each boundary point exactly one of the following holds:
+\begin{enumerate}
+  \item \textbf{Gap} ($g_b > g_{\mathrm{tol}}$): the boundary is free, and new
+        plate is created in the gap (Section~\ref{sec:spreading}). This is a
+        spreading boundary.
+  \item \textbf{Overlap with slab}: subducted columns of $q$ lie beneath $p$ at
+        this point, or vice versa. This is a subduction boundary
+        (Section~\ref{sec:convergent}).
+  \item \textbf{Contact or overlap without slab}: the plates are in contact or
+        have begun to overlap without either having subducted. The boundary
+        transmits normal force and frictional shear
+        (Section~\ref{sec:contact}), and may initiate subduction or weld the
+        plates together.
+\end{enumerate}
+A contact boundary dominated by tangential motion is a transform fault; one
+dominated by convergence is a nascent subduction zone or a collision. The memory
+that would otherwise require stored boundary labels is carried by the geometry
+(gaps filled by new plate) and by the retained slab (subducted columns persist
+until they sink out).
+
+%----------------------------------------------------------------------
+\subsection{Spreading boundaries}
+\label{sec:spreading}
+%----------------------------------------------------------------------
+
+Where the gap between plates $p$ and $q$ exceeds $\Delta x_{\mathrm{acc}}$, new
+plate is created. Vertices are inserted along the midline of the gap,
+duplicated so that each plate receives its own copy, and each plate's mesh is
+extended by a strip of new triangles between its former boundary and the
+midline. New columns are initialized as
+\begin{equation}
+  L = L_0,\quad
+  V_c = h_c^{o}A_v,\quad
+  \rho_{0,c} = \rho_{0,c}^{o},\quad
+  \rho_{0,m} = \rho_{0,m}^{o},\quad
+  w = w^{o},\quad
+  D = 0,\quad
+  T_{ij} = 0,\quad
+  \varsigma = 0.
+\end{equation}
+Boundary edges longer than $\ell_{\max}$ are split. The location and rate of
+spreading are not prescribed: plates separate wherever the force balance
+(Section~\ref{sec:forcebalance}) drives them apart, and new plate fills the
+space. The gravitational potential energy difference between young and old
+lithosphere (``ridge push'') enters through $\Gamma$; no additional ridge force
+is applied. Gaps arising anywhere, not only at established ridges, are filled
+the same way.
+
+%----------------------------------------------------------------------
+\subsection{Contact boundaries}
+\label{sec:contact}
+%----------------------------------------------------------------------
+
+\paragraph{Normal force.}
+Interpenetration without subduction is resisted by a normal contact force per
+unit length,
+\begin{equation}
+  N_c = k_c \mac{-g_b},
+\end{equation}
+with penalty stiffness $k_c$ (or, equivalently, a Lagrange multiplier enforcing
+$g_b \ge 0$). It acts on $p$ as $-N_c n_i$ and equally and oppositely on $q$.
+
+\paragraph{Frictional shear.}
+Sliding is resisted by the strike-slip yield resultant of the weaker of the two
+boundary columns, which already includes the effects of hydration and damage:
+\begin{equation}
+  F_T = \min\left(F_b^{(p)}(0),\,F_b^{(q)}(0)\right),
+  \qquad
+  f^{T}_i = -F_T\,\widehat{(v_t s)}_i \quad \text{on } p,
+\end{equation}
+and oppositely on $q$. No separate fault friction parameter is introduced.
+
+\paragraph{Subduction initiation.}
+If the normal force exceeds the compressional yield resultant of the boundary
+column with the lower buoyancy $B$, and that buoyancy is below the threshold for
+subduction,
+\begin{equation}
+  N_c > F_b^{(\mathrm{dense})}(-1)
+  \quad\text{and}\quad
+  B^{(\mathrm{dense})} < B_{\mathrm{crit}},
+\end{equation}
+the denser plate begins to subduct along the contiguous stretch of boundary
+where these conditions hold: its columns are flagged $\varsigma=1$ as they pass
+beneath the other plate (Section~\ref{sec:convergent}).
+
+\paragraph{Welding.}
+If both boundary columns have $B \ge B_{\mathrm{crit}}$ and the plates are
+converging, neither can subduct. The two meshes are stitched along the contact
+into a single plate, and the stitched columns are given $D = 1$. The resulting
+suture is a weak zone that heals according to Eq.~\eqref{eq:damage} and may be
+reactivated later.
+
+%----------------------------------------------------------------------
+\subsection{Subduction boundaries}
+\label{sec:convergent}
+%----------------------------------------------------------------------
+
+Let plate $p$ be subducting beneath plate $q$. The trench is the part of
+$q$'s boundary that overlies subducted columns of $p$.
+
+\paragraph{Subduction of columns.}
+A column of $p$ with $\varsigma = 0$ is flagged $\varsigma = 1$ when it passes
+beneath $q$ by more than $g_{\mathrm{tol}}$. At that moment its crust is
+partitioned according to its rock type. If $\rho_{0,c} < \rho_{\mathrm{scr}}$
+(buoyant, felsic crust), the entire crustal volume is scraped off: a fraction
+$f_{\mathrm{acc}}$ is transferred to the nearest trench vertex of $q$, and the
+remainder to the nearest unsubducted boundary vertex of $p$, using the mixing
+rule. Denser crust is retained in the slab.
+
+\paragraph{Slab columns.}
+Subducted columns keep their mesh connectivity and frozen state, take no part
+in the force balance of Eq.~\eqref{eq:balance}, and move with the velocity of
+the nearest unsubducted boundary vertex of $p$. The downdip length of slab
+behind each subducted column is not stored but recomputed as its map distance
+$d_v$ from the trench, which grows at the convergence rate regardless of trench
+migration. A subducted column is deleted when
+\begin{equation}
+  d_v > d_{\max} = \frac{z_{\mathrm{slab}}}{\sin\theta_d},
+\end{equation}
+where $\theta_d$ is a representative slab dip and $z_{\mathrm{slab}}$ the depth
+below which the slab no longer pulls on the plate (for example, where it is
+supported at the base of the upper mantle).
+
+\paragraph{Slab pull.}
+Each subducted column has a negative buoyancy computed from its frozen state by
+Eq.~\eqref{eq:buoyancy}, with its retained crust converted to eclogite (density
+$\rho_{\mathrm{ecl}}$ in place of $\rho_{0,c}$). Its downdip weight is
+$W_v = g\sin\theta_d\,\mac{-B_v^{\mathrm{slab}}}\,A_v$. Each subducted column is
+assigned to its nearest unsubducted trench vertex $b$ of $p$, and the slab pull
+per unit length applied at $b$ is
+\begin{equation}
+  f^{sp}_i = \frac{e_{sp}}{\Delta\ell_b}\sum_{v\to b} W_v\; n_i,
+\end{equation}
+where $\Delta\ell_b$ is the boundary length associated with $b$, $n_i$ the
+outward normal of $p$ (perpendicular to the trench), and $e_{sp}$ the fraction of
+slab weight transmitted to the surface plate, the remainder being supported by
+viscous resistance of the mantle \cite{ConradLithgow2002}.
+
+\paragraph{Interface friction.}
+The plate interface extends downdip to depth $z_{\mathrm{int}}$. Its strength is
+computed from the slab columns within map distance
+$d_{\mathrm{int}} = z_{\mathrm{int}}/\tan\theta_d$ of the trench: their
+area-weighted mean damage $\bar D$ and hydration $\bar w$. Integrating frictional
+strength along the slanted interface, with overburden from the overriding
+column,
+\begin{equation}
+  F_{\mathrm{int}} = \frac{\mu_f\,(1-a_b\bar D)\,\big(1-\lambda(\bar w)\big)}{\sin\theta_d}
+  \int_0^{z_{\mathrm{int}}} P_s^{(q)}(\zeta)\dd\zeta.
+\end{equation}
+A wet, damaged interface is therefore weak, as megathrusts are observed to be.
+Its horizontal projection acts on both plates, opposing their relative motion:
+\begin{equation}
+  f^{\mathrm{int}}_i = -F_{\mathrm{int}}\cos\theta_d\,\widehat{\Delta u}_i
+  \ \text{on } p,
+  \qquad
+  +F_{\mathrm{int}}\cos\theta_d\,\widehat{\Delta u}_i
+  \ \text{on } q.
+\end{equation}
+
+\paragraph{Trench suction.}
+Flow around the sinking slab draws the overriding plate toward the trench. This
+is represented by a traction on the trench of $q$, directed outward from $q$,
+\begin{equation}
+  f^{\mathrm{suc}}_i = \xi_s\, f^{sp}\, n^{(q)}_i,
+\end{equation}
+where $f^{sp}$ is the magnitude of the slab pull at the corresponding point of
+$p$. It allows trench retreat and extension of the overriding plate.
+
+\paragraph{Arc processes.}
+Overriding columns of $q$ within map distance $d_{\mathrm{arc}}$ of the trench
+receive hydration released from the slab and crust added by arc magmatism, both
+in proportion to the convergence rate $v_c = \mac{v_n}$:
+\begin{equation}
+  S_w = k_w\,\bar w_{\mathrm{int}}\,\frac{v_c}{d_{\mathrm{arc}}},
+  \qquad
+  \frac{1}{A_v}\frac{\mathrm{D}V_c}{\mathrm{D}t}\bigg|_{\mathrm{arc}}
+  = q_{\mathrm{arc}}\,\frac{v_c}{d_{\mathrm{arc}}},
+\end{equation}
+where $\bar w_{\mathrm{int}}$ is the mean hydration of slab columns at the
+interface, $k_w$ a dimensionless hydration efficiency, and $q_{\mathrm{arc}}$
+the thickness of crust produced per unit length of plate subducted. Arc crust
+has reference density $\rho_{\mathrm{arc}}$ and is combined by the mixing rule.
+
+\paragraph{Termination by collision.}
+If the unsubducted trench columns of $p$ acquire buoyancy
+$B \ge B_{\mathrm{crit}}$, for example because scraped-off crust accumulates
+there or a continent or plateau arrives, subduction ceases along that stretch.
+The slab columns assigned to it are deleted (slab break-off), and the plates are
+welded as in Section~\ref{sec:contact}.
+
+%----------------------------------------------------------------------
+\subsection{Rifting and plate splitting}
+\label{sec:rifting}
+%----------------------------------------------------------------------
+
+The mantle model supplies an upwelling rate $\Upsilon(\mathbf{x},t)$ at the base
+of the plates. Upwelling in excess of a threshold $\Upsilon_c$ thins the plate
+from below and, where the plate is in tension, damages it:
+\begin{equation}
+  S_L^{\Upsilon} = -\mac{\Upsilon - \Upsilon_c},
+  \qquad
+  S_D^{\Upsilon} = k_{\Upsilon}\,\frac{\mac{\Upsilon-\Upsilon_c}}{L}\,\mac{\chi}\,(1-D).
+\end{equation}
+Thinning lowers the strength of the column through $G$; damage lowers it
+directly. Whether a rift develops is then decided by the column rheology and the
+force balance, not prescribed.
+
+A plate is split when a connected path of columns with $D \ge D_{\mathrm{split}}$
+either joins two points on the plate boundary or closes on itself. Vertices
+along the path are duplicated and the mesh is divided into two plates, whose
+new common boundary is then classified as in
+Section~\ref{sec:classification}. Splitting and welding are the only operations
+that change the number of plates.
+
+%----------------------------------------------------------------------
+\subsection{Coverage}
+%----------------------------------------------------------------------
+
+The configuration must satisfy a coverage invariant: every point of the sphere
+lies in exactly one unsubducted column, except within trenches, where subducted
+columns of one plate lie beneath unsubducted columns of another. Gaps narrower
+than $\Delta x_{\mathrm{acc}}$ and overlaps resisted by contact forces are
+transient departures. The invariant is checked each step with the spatial index;
+an unresolvable violation indicates a numerical error.
+
+%======================================================================
+\section{Force balance}
+\label{sec:forcebalance}
+%======================================================================
+
+With lithostatic vertical stress and incompressibility, the depth-integrated
+total horizontal stress of a column is
+\begin{equation}
+  \NN_{ij} = T_{ij} + \delta_{ij}T_{kk} - \delta_{ij}\Gamma.
+\end{equation}
+In the interior of each plate,
+\begin{equation}
+  \partial_j\NN_{ij} + t_i = 0,
+  \label{eq:balance}
+\end{equation}
+where $t_i$ is the traction exerted on the plate base by the underlying mantle,
+modelled as linear drag toward the mantle velocity $u^m_i$ supplied by the
+mantle model:
+\begin{equation}
+  t_i = -C_b\left(u_i - u^m_i\right),
+  \qquad
+  C_b = \frac{\eta_a}{h_a}\left(\frac{L}{L_{\mathrm{ref}}}\right)^{m_b}.
+  \label{eq:drag}
+\end{equation}
+Here $\eta_a$ is the asthenospheric viscosity, $h_a$ the thickness of the basal
+shear zone, and the factor $(L/L_{\mathrm{ref}})^{m_b}$ represents the stronger
+coupling of thick plates whose base reaches faster-moving mantle.
+
+On the boundary of each plate,
+\begin{equation}
+  \NN_{ij}n_j = -\Gamma_{\mathrm{out}}\,n_i + f^{\partial}_i,
+  \label{eq:bc}
+\end{equation}
+where $\Gamma_{\mathrm{out}}$ is the gravitational potential energy of the
+material across the boundary (the neighbouring plate's boundary column at
+contacts and trenches, $\Gamma_0$ at a gap) and $f^{\partial}_i$ is the sum of
+the boundary forces that apply at that point: contact normal force and friction
+(Section~\ref{sec:contact}), slab pull and interface friction on a subducting
+plate, and interface friction and trench suction on an overriding plate
+(Section~\ref{sec:convergent}). Because boundary forces depend on the velocities
+of both plates, the force balances of all plates are solved together.
+
+%======================================================================
+\section{Evolution of the state}
+\label{sec:kinematics}
+%======================================================================
+
+For unsubducted columns:
+\begin{align}
+  \frac{\mathrm{D}V_c}{\mathrm{D}t} &= \text{transfers at trenches and arc addition only},\\
+  \frac{\mathrm{D}L}{\mathrm{D}t} &= -L\,\dot\varepsilon_{kk} + S_L + S_L^{\Upsilon},\\
+  \frac{\mathrm{D}\rho_{0,c}}{\mathrm{D}t} &= \frac{\mathrm{D}\rho_{0,m}}{\mathrm{D}t} = 0
+  \quad\text{(except through the mixing rule)},\\
+  \frac{\mathrm{D}w}{\mathrm{D}t} &= S_w,
+\end{align}
+with $D$ and $T_{ij}$ governed by Eqs.~\eqref{eq:damage} and~\eqref{eq:evp}, and
+$w$, $D$ clamped to $[0,1]$. Crustal thickness changes through $A_v$ as the mesh
+deforms. The thermal source $S_L$ represents conductive cooling toward a
+maximum thickness, with relaxation of mechanically over-thickened plate:
+\begin{equation}
+  S_L =
+  \begin{cases}
+    \dfrac{a_L^2\kappa}{2L}, & L < L_{\max},\\[2ex]
+    -\dfrac{L - L_{\max}}{\tau_L}, & L \ge L_{\max},
+  \end{cases}
+  \qquad
+  L_{\max} = L_{\max}^{o} + \left(L_{\max}^{cr}-L_{\max}^{o}\right)
+  \operatorname{clamp}\!\left(\frac{\rho_{a,0}-\rho_{0,m}}{\rho_{a,0}-\rho_{\mathrm{dep}}},0,1\right),
+\end{equation}
+where $\kappa$ is thermal diffusivity, $a_L$ the coefficient of half-space
+cooling ($L = a_L\sqrt{\kappa t}$ at age $t$), $L_{\max}^{o}$ and
+$L_{\max}^{cr}$ the maximum thicknesses of oceanic and cratonic plates, and
+$\rho_{\mathrm{dep}}$ the reference density of strongly depleted mantle. The
+dependence of $L_{\max}$ on $\rho_{0,m}$ allows depleted mantle to sustain thick
+cratonic roots. Subducted columns have frozen state.
+
+%======================================================================
+\section{Solution strategy}
+\label{sec:solution}
+%======================================================================
+
+\paragraph{Rigid-plate limit.}
+When all plates are much stronger than the forces acting on them, each plate
+moves as a rigid rotation, $u_i = (\boldsymbol\omega_p\times\mathbf{r})_i$, with
+angular velocity $\boldsymbol\omega_p$. Integrating Eq.~\eqref{eq:balance} over
+the plate and using Eq.~\eqref{eq:bc} eliminates the unknown internal stress and
+gives three torque-balance equations per plate,
+\begin{equation}
+  \oint_{\partial\Omega_p}\mathbf{r}\times\left(-\Gamma_{\mathrm{out}}\mathbf{n}
+  + \mathbf{f}^{\partial}\right)\dd\ell
+  + \int_{\Omega_p}\mathbf{r}\times\mathbf{t}\dd A = \mathbf{0},
+  \label{eq:torque}
+\end{equation}
+coupled between plates through the boundary forces. This is the classical
+plate-driving-force problem \cite{ForsythUyeda1975}, solved here with forces
+computed from the column state. Friction makes the system mildly nonlinear; it
+is solved by Picard or Newton iteration.
+
+\paragraph{Deformable plates.}
+The general problem solves Eqs.~\eqref{eq:evp}, \eqref{eq:balance}, and
+\eqref{eq:bc} for the velocity field within all plates simultaneously. The
+rigid-plate solution provides a starting guess and a check: plates whose
+interior stress resultants remain below yield should deform negligibly.
+
+\paragraph{Time step.}
+Each step proceeds in the following order:
+\begin{enumerate}
+  \item Reconstruct profiles and column properties from the state
+        (Sections~\ref{sec:thermal}--\ref{sec:integrated}).
+  \item Compute contact geometry and boundary forces
+        (Section~\ref{sec:boundaries}).
+  \item Solve for velocities (rigid or deformable).
+  \item Advect vertices; move slab columns with their trenches.
+  \item Apply boundary events: create plate in gaps, flag newly subducted
+        columns and scrape their crust, delete slab columns beyond
+        $d_{\max}$, initiate subduction, weld, and split.
+  \item Update $D$, $L$, $w$, $V_c$, and $T_{ij}$.
+  \item Split long edges and remesh where triangles have degraded, remapping
+        extensive quantities ($V_c$, and area-weighted intensive ones)
+        conservatively.
+  \item Check coverage.
+\end{enumerate}
+
+%======================================================================
+\section{Parameters}
+%======================================================================
+
+Status \textsf{T} denotes a typical literature value; \textsf{P} a placeholder
+to be calibrated; \textsf{N} a numerical parameter whose value should not affect
+results when chosen sensibly. Calibration targets include mean elevations of
+ridge crests, old seafloor, and continents; seismogenic depths; effective
+elastic thicknesses; present-day plate speeds and their correlation with
+attached slab length; and the requirement that undamaged lithosphere resist the
+available driving forces (of order \SI{e12}{} to \SI{e13}{\newton\per\metre})
+while damaged lithosphere does not.
+
+\begin{longtable}{@{}lp{7.0cm}rlc@{}}
+\caption{Global parameters.}\label{tab:params}\\
+\toprule
+Symbol & Meaning & Nominal & Units & Status\\
+\midrule
+\endfirsthead
+\toprule
+Symbol & Meaning & Nominal & Units & Status\\
+\midrule
+\endhead
+\bottomrule
+\endfoot
+\multicolumn{5}{@{}l}{\emph{Thermal}}\\
+$T_s$ & surface temperature & 0 & \si{\celsius} & T\\
+$T_L$ & temperature defining the plate base & 1300 & \si{\celsius} & T\\
+$T_p$ & mantle potential temperature & 1350 & \si{\celsius} & T\\
+$\gamma_{\mathrm{ad}}$ & adiabatic gradient & 0.4 & \si{\kelvin\per\kilo\metre} & T\\
+$\kappa$ & thermal diffusivity & \num{1e-6} & \si{\square\metre\per\second} & T\\
+$a_L$ & half-space plate-thickness coefficient & 2.32 & -- & T\\
+$L_{\max}^{o}$ & maximum oceanic plate thickness & 110 & \si{\kilo\metre} & T\\
+$L_{\max}^{cr}$ & maximum cratonic plate thickness & 230 & \si{\kilo\metre} & T\\
+$\tau_L$ & relaxation time of over-thickened plate & 50 & Myr & P\\
+\midrule
+\multicolumn{5}{@{}l}{\emph{Density and isostasy}}\\
+$g$ & gravitational acceleration & 9.81 & \si{\metre\per\square\second} & T\\
+$T_0$ & reference temperature for reference densities & 0 & \si{\celsius} & --\\
+$\alpha$ & thermal expansion coefficient & \num{3.2e-5} & \si{\per\kelvin} & T\\
+$\rho_w$ & seawater density & 1030 & \si{\kilo\gram\per\cubic\metre} & T\\
+$\rho_{a,0}$ & reference density of asthenosphere & 3380 & \si{\kilo\gram\per\cubic\metre} & T\\
+$\rho_{\mathrm{dep}}$ & reference density of strongly depleted mantle & 3310 & \si{\kilo\gram\per\cubic\metre} & T\\
+$z_c$ & compensation depth & 300 & \si{\kilo\metre} & --\\
+$e_{\mathrm{ref}}$ & elevation of the reference column & $-2.5$ & \si{\kilo\metre} & T\\
+\midrule
+\multicolumn{5}{@{}l}{\emph{Friction and pore pressure}}\\
+$\mu_f$ & friction coefficient & 0.6 & -- & T\\
+$\lambda_0$ & pore-pressure ratio, dry (hydrostatic) & 0.37 & -- & T\\
+$\lambda_1$ & pore-pressure ratio, fully hydrated & 0.9 & -- & P\\
+\midrule
+\multicolumn{5}{@{}l}{\emph{Creep and plasticity}}\\
+$n$ & creep stress exponent & 3.5 & -- & T\\
+$R_g$ & gas constant & 8.314 & \si{\joule\per\mole\per\kelvin} & --\\
+$\dot\varepsilon_{\mathrm{ref}}$ & reference strain rate & \num{1e-15} & \si{\per\second} & T\\
+$\rho^{(a)}, T_{bd}^{(a)}, Q^{(a)}$ & closure anchors & Table~\ref{tab:anchors} & & T/P\\
+$\Delta T_w$ & reduction of $T_{bd}$ at full hydration & 150 & \si{\kelvin} & P\\
+$\sigma_{\max}$ & low-temperature plasticity cap & 800 & \si{\mega\pascal} & P\\
+$\kappa_\sigma$ & differential-stress-to-invariant factor & 0.5 & -- & P\\
+$\sigma_{\mathrm{thr}}$ & strength threshold for elastic layers & 10 & \si{\mega\pascal} & P\\
+\midrule
+\multicolumn{5}{@{}l}{\emph{Elasticity}}\\
+$G_s$ & shear modulus & 30 & \si{\giga\pascal} & T\\
+$E$ & Young's modulus (flexure) & 70 & \si{\giga\pascal} & T\\
+$\nu$ & Poisson's ratio (flexure) & 0.25 & -- & T\\
+\midrule
+\multicolumn{5}{@{}l}{\emph{Damage}}\\
+$k_D$ & damage per unit viscoplastic strain & 10 & -- & P\\
+$a_b$ & frictional weakening at full damage & 0.7 & -- & P\\
+$a_d$ & creep weakening at full damage & 0.9 & -- & P\\
+$\tau_{h,0}$ & healing time at $T_{h,0}$ & 100 & Myr & P\\
+$T_{h,0}$ & reference healing temperature & 400 & \si{\celsius} & P\\
+$Q_h$ & healing activation energy & 300 & \si{\kilo\joule\per\mole} & P\\
+$\zeta_h$ & depth at which healing temperature is evaluated & 15 & \si{\kilo\metre} & P\\
+$\ell_D$ & shear-zone width scale & 15 & \si{\kilo\metre} & P\\
+\midrule
+\multicolumn{5}{@{}l}{\emph{Basal coupling}}\\
+$\eta_a$ & asthenospheric viscosity & \num{1e20} & \si{\pascal\second} & T\\
+$h_a$ & basal shear-zone thickness & 100 & \si{\kilo\metre} & P\\
+$L_{\mathrm{ref}}$ & reference plate thickness for coupling & 100 & \si{\kilo\metre} & P\\
+$m_b$ & exponent of thickness dependence of coupling & 1 & -- & P\\
+\midrule
+\multicolumn{5}{@{}l}{\emph{New plate}}\\
+$L_0$ & initial plate thickness & 5 & \si{\kilo\metre} & P\\
+$h_c^{o}$ & oceanic crustal thickness & 7 & \si{\kilo\metre} & T\\
+$\rho_{0,c}^{o}$ & oceanic crust reference density & 2950 & \si{\kilo\gram\per\cubic\metre} & T\\
+$\rho_{0,m}^{o}$ & oceanic mantle reference density & 3360 & \si{\kilo\gram\per\cubic\metre} & T\\
+$w^{o}$ & hydration of new plate & 0 & -- & P\\
+\midrule
+\multicolumn{5}{@{}l}{\emph{Subduction}}\\
+$B_{\mathrm{crit}}$ & buoyancy above which a column cannot subduct & \num{5e6} & \si{\kilo\gram\per\square\metre} & P\\
+$\rho_{\mathrm{scr}}$ & crustal density below which crust is scraped off & 2850 & \si{\kilo\gram\per\cubic\metre} & P\\
+$f_{\mathrm{acc}}$ & fraction of scraped crust accreted to the overriding plate & 0.5 & -- & P\\
+$\theta_d$ & representative slab dip & 45 & \si{\degree} & T\\
+$z_{\mathrm{slab}}$ & depth limit of slab pull & 660 & \si{\kilo\metre} & T\\
+$\rho_{\mathrm{ecl}}$ & reference density of eclogitized slab crust & 3500 & \si{\kilo\gram\per\cubic\metre} & T\\
+$e_{sp}$ & fraction of slab weight transmitted to the plate & 0.2 & -- & P\\
+$z_{\mathrm{int}}$ & depth extent of the plate interface & 40 & \si{\kilo\metre} & T\\
+$\xi_s$ & trench suction relative to slab pull & 0.1 & -- & P\\
+$d_{\mathrm{arc}}$ & width of the arc region & 150 & \si{\kilo\metre} & T\\
+$k_w$ & hydration efficiency of slab fluids & 1 & -- & P\\
+$q_{\mathrm{arc}}$ & arc crust produced per unit length subducted & 1 & \si{\kilo\metre} & P\\
+$\rho_{\mathrm{arc}}$ & reference density of arc crust & 2800 & \si{\kilo\gram\per\cubic\metre} & T\\
+\midrule
+\multicolumn{5}{@{}l}{\emph{Rifting and splitting}}\\
+$\Upsilon_c$ & upwelling threshold for basal thinning & -- & \si{\metre\per\second} & P\\
+$k_\Upsilon$ & damage efficiency of upwelling & 1 & -- & P\\
+$D_{\mathrm{split}}$ & damage threshold for plate splitting & 0.9 & -- & P\\
+\midrule
+\multicolumn{5}{@{}l}{\emph{Numerical}}\\
+$g_{\mathrm{tol}}$ & contact tolerance & \textasciitilde mesh/10 & \si{\metre} & N\\
+$\Delta x_{\mathrm{acc}}$ & gap width that triggers plate creation & \textasciitilde mesh/2 & \si{\metre} & N\\
+$\ell_{\max}$ & maximum boundary edge length & \textasciitilde mesh & \si{\metre} & N\\
+$k_c$ & contact penalty stiffness & large & \si{\newton\per\square\metre} & N\\
+$v_{\mathrm{reg}}$ & friction regularization speed & 0.1 & mm/yr & N\\
+\end{longtable}
+
+%======================================================================
+\section{Assumptions and limitations}
+%======================================================================
+
+\begin{itemize}
+  \item \textbf{Thin-sheet kinematics.} Horizontal velocity is uniform with depth
+        in each column; decoupling of crust from mantle is represented only
+        through the effective elastic thickness.
+  \item \textbf{Linear geotherm.} Crustal radiogenic heating and the
+        error-function profile of young oceanic plate are neglected; resulting
+        errors are partly absorbed by calibration.
+  \item \textbf{Phenomenological closures.} The density-based choice of creep
+        properties, the hydration and damage weakening laws, and the rules for
+        scraping, arc production, and slab pull transmission reproduce
+        qualitative behaviour and ordering, not laboratory or field
+        quantities.
+  \item \textbf{Absolute densities.} An error of
+        \SI{10}{\kilo\gram\per\cubic\metre} in a reference density over
+        \SI{200}{\kilo\metre} of column changes isostatic elevation by about
+        \SI{0.6}{\kilo\metre}. Reference densities should be calibrated against
+        elevations.
+  \item \textbf{Slab representation.} The slab has a single representative dip
+        and is passive: it transmits a fixed fraction of its weight and has no
+        internal dynamics, thermal assimilation, or interaction with the
+        mantle flow beyond its removal at $d_{\max}$.
+  \item \textbf{Mantle coupling is one-way.} The mantle model supplies $u^m_i$
+        and $\Upsilon$; plates and slabs do not feed back on mantle flow.
+  \item \textbf{Fixed brittle--ductile partition} at the reference strain rate,
+        and incompressible in-plane elasticity alongside a compressible
+        Poisson's ratio for flexure.
+  \item \textbf{Topology changes} (creation, subduction, welding, splitting)
+        are discrete events applied between force-balance solutions; their
+        rules involve thresholds whose influence on results should be tested.
+\end{itemize}
+
+%======================================================================
+\begin{thebibliography}{99}
+%======================================================================
+
+\bibitem{BercoviciRicard2012}
+D.~Bercovici and Y.~Ricard,
+Mechanisms for the generation of plate tectonics by two-phase grain-damage and
+pinning,
+\emph{Physics of the Earth and Planetary Interiors} \textbf{202--203}, 27--55 (2012).
+
+\bibitem{BurovDiament1995}
+E.~B. Burov and M.~Diament,
+The effective elastic thickness ($T_e$) of continental lithosphere: What does it
+really mean?
+\emph{Journal of Geophysical Research} \textbf{100}(B3), 3905--3927 (1995).
+
+\bibitem{Byerlee1978}
+J.~Byerlee,
+Friction of rocks,
+\emph{Pure and Applied Geophysics} \textbf{116}, 615--626 (1978).
+
+\bibitem{ConradLithgow2002}
+C.~P. Conrad and C.~Lithgow-Bertelloni,
+How mantle slabs drive plate tectonics,
+\emph{Science} \textbf{298}, 207--209 (2002).
+
+\bibitem{EnglandMcKenzie1982}
+P.~England and D.~McKenzie,
+A thin viscous sheet model for continental deformation,
+\emph{Geophysical Journal of the Royal Astronomical Society} \textbf{70},
+295--321 (1982).
+
+\bibitem{ForsythUyeda1975}
+D.~Forsyth and S.~Uyeda,
+On the relative importance of the driving forces of plate motion,
+\emph{Geophysical Journal of the Royal Astronomical Society} \textbf{43},
+163--200 (1975).
+
+\bibitem{GleasonTullis1995}
+G.~C. Gleason and J.~Tullis,
+A flow law for dislocation creep of quartz aggregates determined with the molten
+salt cell,
+\emph{Tectonophysics} \textbf{247}, 1--23 (1995).
+
+\bibitem{HirthKohlstedt2003}
+G.~Hirth and D.~Kohlstedt,
+Rheology of the upper mantle and the mantle wedge: A view from the
+experimentalists,
+in \emph{Inside the Subduction Factory}, Geophysical Monograph 138, American
+Geophysical Union, 83--105 (2003).
+
+\bibitem{Mackwell1998}
+S.~J. Mackwell, M.~E. Zimmerman, and D.~L. Kohlstedt,
+High-temperature deformation of dry diabase with application to tectonics on
+Venus,
+\emph{Journal of Geophysical Research} \textbf{103}(B1), 975--984 (1998).
+
+\bibitem{Saramito2009}
+P.~Saramito,
+A new elastoviscoplastic model based on the Herschel--Bulkley viscoplastic
+model,
+\emph{Journal of Non-Newtonian Fluid Mechanics} \textbf{158}, 154--161 (2009).
+
+\end{thebibliography}
+
+\end{document}
