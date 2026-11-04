@@ -72,6 +72,14 @@ select { width: 100%; background: #10161f; color: var(--fg); border: 1px solid v
 .check { display: flex; gap: 8px; align-items: center; font-size: 13px; }
 .check input { accent-color: var(--accent); }
 
+.mixbox { display: flex; flex-direction: column; gap: 5px; }
+.mixbox .lbl { font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); }
+#mix { display: flex; height: 8px; border-radius: 2px; overflow: hidden; background: #1a2230; }
+#mix i { flex: 0 0 0; flex-basis: 0; display: block; }
+#mix-key { display: flex; flex-wrap: wrap; gap: 3px 10px; font: 11px var(--font-data); color: var(--muted); font-variant-numeric: tabular-nums; }
+#mix-key span { display: inline-flex; align-items: center; gap: 4px; }
+#mix-key i { width: 8px; height: 8px; border-radius: 1px; display: inline-block; }
+#mix-key b { color: var(--fg); font-weight: 500; }
 #legend[hidden] { display: none; }
 #legend { display: flex; flex-direction: column; gap: 3px; }
 #legend canvas { width: 100%; height: 10px; border-radius: 2px; display: block; }
@@ -89,7 +97,7 @@ select { width: 100%; background: #10161f; color: var(--fg); border: 1px solid v
 
 <aside id="panel">
   <header>
-    <h1>Polyplates<small>v0.1 kinematic</small></h1>
+    <h1>Polyplates<small>v0.2 spreading</small></h1>
     <button id="collapse" aria-expanded="true" aria-controls="body">hide</button>
   </header>
   <div id="body">
@@ -98,6 +106,14 @@ select { width: 100%; background: #10161f; color: var(--fg); border: 1px solid v
       <div><span>plates</span><b id="r-plates">–</b></div>
       <div><span>columns</span><b id="r-cols">–</b></div>
       <div><span>land area</span><b id="r-land">–</b></div>
+      <div><span>uncovered</span><b id="r-gap">–</b></div>
+      <div><span>overlapped</span><b id="r-over">–</b></div>
+    </div>
+
+    <div class="mixbox">
+      <span class="lbl">Boundary length by type</span>
+      <div id="mix"></div>
+      <div id="mix-key"></div>
     </div>
 
     <div class="buttons">
@@ -148,14 +164,15 @@ select { width: 100%; background: #10161f; color: var(--fg); border: 1px solid v
         <option value="hc">Crustal thickness h_c</option>
       </select>
       <div id="legend"><canvas id="legend-bar" width="256" height="10"></canvas><div class="ticks" id="legend-ticks"></div></div>
-      <label class="check"><input id="bounds" type="checkbox" checked> Plate outlines</label>
+      <label class="check"><input id="bounds" type="checkbox" checked> Boundaries coloured by type</label>
     </fieldset>
 
     <div class="status">
       <b>Simulated now:</b> separate plate meshes on prescribed rigid rotations; per-column state;
-      elevation from local isostasy; conductive thickening of L.
-      <span class="gap">Orange</span> is exposed asthenosphere in gaps that spreading will fill in the next version.
-      Overlaps are not yet resolved.
+      isostatic elevation; conductive thickening of L. Boundaries are classified each step from the signed gap
+      and relative velocity, and gaps wider than about one vertex spacing are filled with new sea floor.
+      <span class="gap">Orange</span> slivers are gaps still narrower than that.
+      Overlaps are detected but not yet resolved (subduction comes next).
     </div>
   </div>
 </aside>
@@ -166,12 +183,14 @@ select { width: 100%; background: #10161f; color: var(--fg); border: 1px solid v
 <script>
 "use strict";
 /* ======================================================================
-   Polyplates v0.1 — kinematic scaffold.
+   Polyplates v0.2 — kinematic plates with contact geometry and spreading.
    Section numbers (§) refer to the model description (docs/lithosphere_plate_model.tex).
+   Lengths on the unit sphere are written in units of the mean vertex spacing s.
    ====================================================================== */
 
 // ---------- constants & parameters (Table: Global parameters) ----------
 const MYR = 3.15576e13;               // seconds per Myr
+const YR = 3.15576e7;
 const P = {
   R: 6371e3,                          // planet radius (m)
   Ts: 0, TL: 1300, Tp: 1350, gad: 0.4e-3, T0: 0,
@@ -179,30 +198,66 @@ const P = {
   kappa: 1e-6, aL: 2.32, Lmax_o: 110e3, Lmax_cr: 230e3, tauL: 50 * MYR,
   L0: 5e3, hc_o: 7e3, rhoc_o: 2950, rhom_o: 3360,
   e_ref: -2500,
-  // Initial continental columns (not in the spec; calibrated in v0.1 so interiors sit ~+1 km):
-  rhoc_cont: 2850,
+  rhoc_cont: 2850,                    // initial continental crust (calibrated in v0.1, see PLAN.md)
 };
+// Numerical parameters (status N), as multiples of the mean spacing s
+const NUM = {
+  gtol: 0.2,       // g_tol: contact tolerance
+  dxacc: 1.0,      // Δx_acc: gap width that triggers plate creation
+  lmax: 1.6,       // ℓ_max: boundary edges longer than this are split
+  merge: 0.4,      // new midline vertices closer than this are merged
+  reach: 1.0,      // largest extension per event when the far side is out of range
+  cell: 3.0,       // spatial-hash cell size for boundary segments
+};
+const CLS = { GAP: 0, DIV: 1, TRANS: 2, CONV: 3, OVER: 4 };
+const CLS_COLOR = [0xffa94d, 0xffe066, 0x69db7c, 0xff5c6c, 0xd68cff];
+const CLS_NAME = ["gap", "spreading", "transform", "convergent", "overlap"];
+
+// ---------- small vector helpers on flat arrays ----------
+const dot3 = (a, i, b, j) => a[i] * b[j] + a[i + 1] * b[j + 1] + a[i + 2] * b[j + 2];
+function qmat(q) {
+  const { x, y, z, w } = q;
+  return [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w),
+          2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w),
+          2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)];
+}
 
 // ---------- seeded PRNG ----------
 function mulberry32(a) { return function () { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
-function gauss(rng) { let u = 0, v = 0; while (u === 0) u = rng(); v = rng(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); }
+function gauss(rng) { let u = 0; while (u === 0) u = rng(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * rng()); }
+
+// binary min-heap keyed on a number, carrying two integer payloads
+class Heap {
+  constructor() { this.k = []; this.a = []; this.b = []; }
+  get size() { return this.k.length; }
+  push(k, a, b) {
+    const K = this.k, A = this.a, B = this.b; let i = K.length; K.push(k); A.push(a); B.push(b);
+    while (i > 0) { const p = (i - 1) >> 1; if (K[p] <= k) break; K[i] = K[p]; A[i] = A[p]; B[i] = B[p]; i = p; }
+    K[i] = k; A[i] = a; B[i] = b;
+  }
+  pop() { // returns [k, a, b]
+    const K = this.k, A = this.a, B = this.b, top = [K[0], A[0], B[0]];
+    const k = K.pop(), a = A.pop(), b = B.pop(), n = K.length;
+    if (n) {
+      let i = 0;
+      for (;;) { const l = 2 * i + 1, r = l + 1; let m = i, mk = k; if (l < n && K[l] < mk) { m = l; mk = K[l]; } if (r < n && K[r] < mk) m = r; if (m === i) break; K[i] = K[m]; A[i] = A[m]; B[i] = B[m]; i = m; }
+      K[i] = k; A[i] = a; B[i] = b;
+    }
+    return top;
+  }
+}
 
 // ---------- §5–6: density, isostasy ----------
-// ∫_a^b ρ0[1 − α(Ts + Gζ − T0)] dζ for the linear geotherm (Eq. geotherm)
 function layerMass(r0, a, b, G) { return r0 * ((b - a) * (1 - P.alpha * (P.Ts - P.T0)) - P.alpha * G * (b * b - a * a) / 2); }
-function asthMass(a) { // ∫_a^zc ρ_a(z) dz along the adiabat
-  return P.rho_a0 * ((P.zc - a) * (1 - P.alpha * (P.Tp - P.T0)) - P.alpha * P.gad * (P.zc * P.zc - a * a) / 2);
-}
+function asthMass(a) { return P.rho_a0 * ((P.zc - a) * (1 - P.alpha * (P.Tp - P.T0)) - P.alpha * P.gad * (P.zc * P.zc - a * a) / 2); }
 function columnMass(e, hc, rc, rm, L) {
   const G = (P.TL - P.Ts) / L;
   return P.rho_w * Math.max(-e, 0) + layerMass(rc, 0, hc, G) + layerMass(rm, hc, L, G) + asthMass(L - e);
 }
 const M_REF = columnMass(P.e_ref, P.hc_o, P.rhoc_o, P.rhom_o, P.L0); // reference column = new ridge column
-// Newton solve of M(e) = M_ref; dM/de = ρ_a(L−e) − ρ_w[e<0] > 0
 function isostaticElevation(e, hc, rc, rm, L, iters) {
   for (let i = 0; i < iters; i++) {
-    const f = columnMass(e, hc, rc, rm, L) - M_REF;
-    const a = L - e;
+    const f = columnMass(e, hc, rc, rm, L) - M_REF, a = L - e;
     const d = P.rho_a0 * (1 - P.alpha * (P.Tp + P.gad * a - P.T0)) - (e < 0 ? P.rho_w : 0);
     const de = f / d; e -= de;
     if (Math.abs(de) < 0.5) break;
@@ -214,106 +269,76 @@ function Lmax(rm) {
   return P.Lmax_o + (P.Lmax_cr - P.Lmax_o) * s;
 }
 
-// ---------- spherical Delaunay mesh ----------
-// Jittered Fibonacci points; Delaunay via stereographic projection from point 0 (circles map to circles).
+// ---------- spherical Delaunay mesh (jittered Fibonacci points, stereographic projection + Delaunator) ----------
 function buildSphere(N, rng) {
-  const pts = new Float64Array(3 * N);
-  const ga = Math.PI * (3 - Math.sqrt(5));
-  const jit = 0.35 * Math.sqrt(4 * Math.PI / N); // fraction of mean spacing (radians)
+  const pts = new Float64Array(3 * N), ga = Math.PI * (3 - Math.sqrt(5)), jit = 0.35 * Math.sqrt(4 * Math.PI / N);
   for (let i = 0; i < N; i++) {
-    let z = 1 - (2 * i + 1) / N, phi = i * ga;
-    let r = Math.sqrt(1 - z * z);
+    let z = 1 - (2 * i + 1) / N; const phi = i * ga, r = Math.sqrt(1 - z * z);
     let x = r * Math.cos(phi), y = r * Math.sin(phi);
-    if (i > 0) { // jitter in tangent plane
-      x += jit * gauss(rng) * 0.5; y += jit * gauss(rng) * 0.5; z += jit * gauss(rng) * 0.5;
-      const n = Math.hypot(x, y, z); x /= n; y /= n; z /= n;
-    } else { x = 0; y = 0; z = 1; }
+    if (i > 0) { x += jit * gauss(rng) * 0.5; y += jit * gauss(rng) * 0.5; z += jit * gauss(rng) * 0.5; const n = Math.hypot(x, y, z); x /= n; y /= n; z /= n; }
+    else { x = 0; y = 0; z = 1; }
     pts[3 * i] = x; pts[3 * i + 1] = y; pts[3 * i + 2] = z;
   }
   const coords = new Float64Array(2 * (N - 1));
-  for (let i = 1; i < N; i++) {
-    const x = pts[3 * i], y = pts[3 * i + 1], z = pts[3 * i + 2], s = 1 / (1 - z);
-    coords[2 * (i - 1)] = x * s; coords[2 * (i - 1) + 1] = y * s;
-  }
+  for (let i = 1; i < N; i++) { const s = 1 / (1 - pts[3 * i + 2]); coords[2 * i - 2] = pts[3 * i] * s; coords[2 * i - 1] = pts[3 * i + 1] * s; }
   const d = new Delaunator(coords);
-  const nt = d.triangles.length / 3 + d.hull.length;
-  const tris = new Uint32Array(3 * nt);
+  const nt = d.triangles.length / 3 + d.hull.length, tris = new Uint32Array(3 * nt);
   let k = 0;
   for (let t = 0; t < d.triangles.length; t++) tris[k++] = d.triangles[t] + 1;
-  for (let h = 0; h < d.hull.length; h++) {
-    tris[k++] = d.hull[h] + 1; tris[k++] = d.hull[(h + 1) % d.hull.length] + 1; tris[k++] = 0;
-  }
-  // enforce outward (counter-clockwise seen from outside) orientation
-  for (let t = 0; t < nt; t++) {
-    const a = tris[3 * t], b = tris[3 * t + 1], c = tris[3 * t + 2];
-    const ax = pts[3 * a], ay = pts[3 * a + 1], az = pts[3 * a + 2];
-    const ux = pts[3 * b] - ax, uy = pts[3 * b + 1] - ay, uz = pts[3 * b + 2] - az;
-    const vx = pts[3 * c] - ax, vy = pts[3 * c + 1] - ay, vz = pts[3 * c + 2] - az;
-    const nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
-    if (nx * ax + ny * ay + nz * az < 0) { tris[3 * t + 1] = c; tris[3 * t + 2] = b; }
-  }
+  for (let h = 0; h < d.hull.length; h++) { tris[k++] = d.hull[h] + 1; tris[k++] = d.hull[(h + 1) % d.hull.length] + 1; tris[k++] = 0; }
+  for (let t = 0; t < nt; t++) if (orient(pts, tris[3 * t], tris[3 * t + 1], tris[3 * t + 2]) < 0) { const b = tris[3 * t + 1]; tris[3 * t + 1] = tris[3 * t + 2]; tris[3 * t + 2] = b; }
   return { N, pts, tris, nt };
 }
+// a·((b−a)×(c−a)): twice the signed area, positive for counter-clockwise seen from outside
+function orient(p, a, b, c) {
+  const ax = p[3 * a], ay = p[3 * a + 1], az = p[3 * a + 2];
+  const ux = p[3 * b] - ax, uy = p[3 * b + 1] - ay, uz = p[3 * b + 2] - az;
+  const vx = p[3 * c] - ax, vy = p[3 * c + 1] - ay, vz = p[3 * c + 2] - az;
+  return ax * (uy * vz - uz * vy) + ay * (uz * vx - ux * vz) + az * (ux * vy - uy * vx);
+}
+function triArea(p, a, b, c) {
+  const ux = p[3 * b] - p[3 * a], uy = p[3 * b + 1] - p[3 * a + 1], uz = p[3 * b + 2] - p[3 * a + 2];
+  const wx = p[3 * c] - p[3 * a], wy = p[3 * c + 1] - p[3 * a + 1], wz = p[3 * c + 2] - p[3 * a + 2];
+  return 0.5 * Math.hypot(uy * wz - uz * wy, uz * wx - ux * wz, ux * wy - uy * wx);
+}
 
-// adjacency: vertex CSR, triangle neighbours (via shared edges), dual-cell areas
 function buildTopology(S) {
   const { N, pts, tris, nt } = S;
-  const deg = new Uint32Array(N);
-  const edgeTri = new Map();             // key a*N+b (a<b) → first triangle
-  const triNb = new Int32Array(3 * nt).fill(-1);
-  const area = new Float64Array(N);
+  const edgeTri = new Map(), triNb = new Int32Array(3 * nt).fill(-1), area = new Float64Array(N);
   const vlists = Array.from({ length: N }, () => []);
   for (let t = 0; t < nt; t++) {
-    const v = [tris[3 * t], tris[3 * t + 1], tris[3 * t + 2]];
-    // flat triangle area, scaled later
-    const [a, b, c] = v;
-    const ux = pts[3 * b] - pts[3 * a], uy = pts[3 * b + 1] - pts[3 * a + 1], uz = pts[3 * b + 2] - pts[3 * a + 2];
-    const wx = pts[3 * c] - pts[3 * a], wy = pts[3 * c + 1] - pts[3 * a + 1], wz = pts[3 * c + 2] - pts[3 * a + 2];
-    const ar = 0.5 * Math.hypot(uy * wz - uz * wy, uz * wx - ux * wz, ux * wy - uy * wx);
-    area[a] += ar / 3; area[b] += ar / 3; area[c] += ar / 3;
+    const v = [tris[3 * t], tris[3 * t + 1], tris[3 * t + 2]], ar = triArea(pts, v[0], v[1], v[2]);
     for (let e = 0; e < 3; e++) {
-      const p = v[e], q = v[(e + 1) % 3];
-      const lo = Math.min(p, q), hi = Math.max(p, q), key = lo * N + hi;
-      const o = edgeTri.get(key);
+      area[v[e]] += ar / 3;
+      const p = v[e], q = v[(e + 1) % 3], key = Math.min(p, q) * N + Math.max(p, q), o = edgeTri.get(key);
       if (o === undefined) { edgeTri.set(key, 3 * t + e); vlists[p].push(q); vlists[q].push(p); }
-      else { const ot = (o / 3) | 0; triNb[3 * t + e] = ot; triNb[o] = t; }
+      else { triNb[3 * t + e] = (o / 3) | 0; triNb[o] = t; }
     }
   }
   let total = 0; for (let i = 0; i < N; i++) total += area[i];
-  const scale = 4 * Math.PI * P.R * P.R / total;
-  for (let i = 0; i < N; i++) area[i] *= scale;
-  const off = new Uint32Array(N + 1);
-  for (let i = 0; i < N; i++) off[i + 1] = off[i] + vlists[i].length;
-  const nb = new Uint32Array(off[N]);
-  for (let i = 0; i < N; i++) nb.set(vlists[i], off[i]);
-  S.off = off; S.nb = nb; S.triNb = triNb; S.area = area;
-  S.spacing = Math.sqrt(4 * Math.PI / N) * P.R;
+  for (let i = 0; i < N; i++) area[i] *= 4 * Math.PI * P.R * P.R / total;
+  const off = new Uint32Array(N + 1); for (let i = 0; i < N; i++) off[i + 1] = off[i] + vlists[i].length;
+  const nb = new Uint32Array(off[N]); for (let i = 0; i < N; i++) nb.set(vlists[i], off[i]);
+  Object.assign(S, { off, nb, triNb, area, s: Math.sqrt(4 * Math.PI / N) });
 }
 
-// multi-source graph distance (Dijkstra with a binary heap) along mesh edges, metres
 function graphDistance(S, sources) {
-  const { N, off, nb, pts } = S;
-  const dist = new Float64Array(N).fill(Infinity);
-  const heap = []; // [d, v]
-  const push = (d, v) => { heap.push([d, v]); let i = heap.length - 1; while (i > 0) { const p = (i - 1) >> 1; if (heap[p][0] <= heap[i][0]) break; [heap[p], heap[i]] = [heap[i], heap[p]]; i = p; } };
-  const pop = () => { const top = heap[0], last = heap.pop(); if (heap.length) { heap[0] = last; let i = 0; for (;;) { const l = 2 * i + 1, r = l + 1; let m = i; if (l < heap.length && heap[l][0] < heap[m][0]) m = l; if (r < heap.length && heap[r][0] < heap[m][0]) m = r; if (m === i) break; [heap[m], heap[i]] = [heap[i], heap[m]]; i = m; } } return top; };
-  for (const s of sources) { dist[s] = 0; push(0, s); }
-  while (heap.length) {
-    const [d, v] = pop(); if (d > dist[v]) continue;
+  const { N, off, nb, pts } = S, dist = new Float64Array(N).fill(Infinity), H = new Heap();
+  for (const s of sources) { dist[s] = 0; H.push(0, s, 0); }
+  while (H.size) {
+    const [d, v] = H.pop(); if (d > dist[v]) continue;
     for (let j = off[v]; j < off[v + 1]; j++) {
-      const u = nb[j];
-      const len = P.R * Math.hypot(pts[3 * u] - pts[3 * v], pts[3 * u + 1] - pts[3 * v + 1], pts[3 * u + 2] - pts[3 * v + 2]);
-      if (d + len < dist[u]) { dist[u] = d + len; push(dist[u], u); }
+      const u = nb[j], len = P.R * Math.hypot(pts[3 * u] - pts[3 * v], pts[3 * u + 1] - pts[3 * v + 1], pts[3 * u + 2] - pts[3 * v + 2]);
+      if (d + len < dist[u]) { dist[u] = d + len; H.push(dist[u], u, 0); }
     }
   }
   return dist;
 }
 
-// smooth random field on vertices (a few Laplacian passes over white noise), unit variance-ish
 function smoothNoise(S, rng, passes) {
   const { N, off, nb } = S;
-  let f = new Float64Array(N); for (let i = 0; i < N; i++) f[i] = gauss(rng);
-  let g = new Float64Array(N);
+  let f = new Float64Array(N), g = new Float64Array(N);
+  for (let i = 0; i < N; i++) f[i] = gauss(rng);
   for (let p = 0; p < passes; p++) {
     for (let i = 0; i < N; i++) { let s = f[i]; for (let j = off[i]; j < off[i + 1]; j++) s += f[nb[j]]; g[i] = s / (off[i + 1] - off[i] + 1); }
     [f, g] = [g, f];
@@ -324,26 +349,117 @@ function smoothNoise(S, rng, passes) {
   return f;
 }
 
-// weighted random-frontier growth: a few seeds compete to claim items of a graph
+// weighted random-frontier growth (fractal outlines; used for continents)
 function growRegions(nItems, neighbours, seeds, weights, rng, limit) {
-  const owner = new Int32Array(nItems).fill(-1);
-  const frontiers = seeds.map(s => [s]);
-  let claimed = 0, active = seeds.length;
-  const wsum = () => weights.reduce((s, w, i) => s + (frontiers[i].length ? w : 0), 0);
-  while (active > 0 && claimed < limit) {
-    let r = rng() * wsum(), p = 0;
-    for (; p < frontiers.length; p++) { if (!frontiers[p].length) continue; r -= weights[p]; if (r <= 0) break; }
-    if (p >= frontiers.length) p = frontiers.findIndex(f => f.length);
-    const F = frontiers[p];
-    const k = (rng() * F.length) | 0; const item = F[k]; F[k] = F[F.length - 1]; F.pop();
-    if (!F.length) active--;
+  const owner = new Int32Array(nItems).fill(-1), frontiers = seeds.map(s => [s]);
+  let claimed = 0;
+  while (claimed < limit) {
+    let wsum = 0; for (let i = 0; i < frontiers.length; i++) if (frontiers[i].length) wsum += weights[i];
+    if (wsum === 0) break;
+    let r = rng() * wsum, p = 0;
+    for (; p < frontiers.length - 1; p++) { if (!frontiers[p].length) continue; r -= weights[p]; if (r <= 0) break; }
+    while (!frontiers[p].length) p--;
+    const F = frontiers[p], k = (rng() * F.length) | 0, item = F[k]; F[k] = F[F.length - 1]; F.pop();
     if (owner[item] !== -1) continue;
     owner[item] = p; claimed++;
-    const wasEmpty = F.length === 0;
     neighbours(item, n => { if (owner[n] === -1) F.push(n); });
-    if (wasEmpty && F.length) active++;
   }
   return owner;
+}
+
+// plates: multiplicatively weighted Voronoi on the triangle graph with noisy edge costs → smooth, curved outlines
+function partitionPlates(S, nP, rng) {
+  const { nt, tris, pts, triNb } = S;
+  const cent = new Float64Array(3 * nt);
+  for (let t = 0; t < nt; t++) for (let e = 0; e < 3; e++) { const v = tris[3 * t + e]; cent[3 * t] += pts[3 * v] / 3; cent[3 * t + 1] += pts[3 * v + 1] / 3; cent[3 * t + 2] += pts[3 * v + 2] / 3; }
+  const vn = smoothNoise(S, rng, Math.max(4, Math.round(Math.sqrt(S.N) / 10)));
+  const tn = new Float64Array(nt); for (let t = 0; t < nt; t++) tn[t] = (vn[tris[3 * t]] + vn[tris[3 * t + 1]] + vn[tris[3 * t + 2]]) / 3;
+  const owner = new Int32Array(nt).fill(-1), H = new Heap(), used = new Set();
+  const w = [];
+  for (let p = 0; p < nP; p++) {
+    let t; do { t = (rng() * nt) | 0; } while (used.has(t)); used.add(t);
+    w.push(Math.exp(0.35 * gauss(rng))); H.push(0, t, p);
+  }
+  while (H.size) {
+    const [d, t, p] = H.pop(); if (owner[t] !== -1) continue; owner[t] = p;
+    for (let e = 0; e < 3; e++) {
+      const u = triNb[3 * t + e]; if (u < 0 || owner[u] !== -1) continue;
+      const len = Math.hypot(cent[3 * u] - cent[3 * t], cent[3 * u + 1] - cent[3 * t + 1], cent[3 * u + 2] - cent[3 * t + 2]);
+      H.push(d + len * Math.exp(0.6 * tn[u]) / w[p], u, p);
+    }
+  }
+  for (let pass = 0; pass < 3; pass++) for (let t = 0; t < nt; t++) { // remove one-triangle spikes
+    const a = owner[triNb[3 * t]], b = owner[triNb[3 * t + 1]], c = owner[triNb[3 * t + 2]];
+    if (a === b && a !== owner[t]) owner[t] = a; else if (b === c && b !== owner[t]) owner[t] = b; else if (a === c && a !== owner[t]) owner[t] = a;
+  }
+  return owner;
+}
+
+// ---------- growable plate meshes ----------
+const F64 = ["A", "Vc", "rhoc", "rhom", "L", "e"], F32 = ["w", "D"], V3 = ["pos", "wpos"];
+function newPlate(id, axis, omega, hue) {
+  return { id, axis, omega, hue, q: new THREE.Quaternion(), n: 0, cap: 0, nt: 0, tcap: 0, tri: new Uint32Array(0), version: 0 };
+}
+function growPlate(pl, need) {
+  if (need <= pl.cap) return;
+  const cap = Math.max(need, Math.ceil(pl.cap * 1.5) + 64), cp = (Ctor, f, k) => { const a = new Ctor(k * cap); if (pl[f]) a.set(pl[f].subarray(0, k * pl.n)); pl[f] = a; };
+  for (const f of F64) cp(Float64Array, f, 1);
+  for (const f of F32) cp(Float32Array, f, 1);
+  for (const f of V3) cp(Float64Array, f, 3);
+  cp(Float32Array, "T", 3); cp(Uint8Array, "sub", 1);
+  pl.cap = cap;
+}
+function addVertex(pl, x, y, z) { growPlate(pl, pl.n + 1); const k = pl.n++; pl.pos[3 * k] = x; pl.pos[3 * k + 1] = y; pl.pos[3 * k + 2] = z; return k; }
+function addTri(pl, a, b, c) {
+  if (pl.nt + 1 > pl.tcap) { const cap = Math.ceil(pl.tcap * 1.5) + 128, t = new Uint32Array(3 * cap); t.set(pl.tri.subarray(0, 3 * pl.nt)); pl.tri = t; pl.tcap = cap; }
+  pl.tri[3 * pl.nt] = a; pl.tri[3 * pl.nt + 1] = b; pl.tri[3 * pl.nt + 2] = c; pl.nt++;
+}
+function computeAreas(pl) {
+  pl.A.fill(0, 0, pl.n);
+  const R2 = P.R * P.R;
+  for (let t = 0; t < pl.nt; t++) {
+    const a = pl.tri[3 * t], b = pl.tri[3 * t + 1], c = pl.tri[3 * t + 2], ar = triArea(pl.pos, a, b, c) * R2 / 3;
+    pl.A[a] += ar; pl.A[b] += ar; pl.A[c] += ar;
+  }
+}
+// directed boundary edges (a→b in triangle order, so the plate interior lies to the left)
+function extractBoundary(pl) {
+  const n = pl.n, ne = 3 * pl.nt, M = 1 << Math.ceil(Math.log2(2 * ne + 16)), mask = M - 1;
+  const keys = new Float64Array(M).fill(-1), val = new Int32Array(M);
+  for (let t = 0; t < pl.nt; t++) for (let e = 0; e < 3; e++) {
+    const a = pl.tri[3 * t + e], b = pl.tri[3 * t + (e + 1) % 3], lo = a < b ? a : b, hi = a < b ? b : a, key = lo * n + hi;
+    let h = (Math.imul(lo, 0x9E3779B1) ^ hi) & mask;
+    while (keys[h] !== -1 && keys[h] !== key) h = (h + 1) & mask;
+    if (keys[h] === key) val[h] = -1; else { keys[h] = key; val[h] = 3 * t + e; }
+  }
+  const be = [], code = [];
+  for (let h = 0; h < M; h++) { const c = val[h]; if (keys[h] !== -1 && c >= 0) { const t = (c / 3) | 0, e = c % 3; be.push(pl.tri[3 * t + e], pl.tri[3 * t + (e + 1) % 3]); code.push(c); } }
+  pl.bedge = Uint32Array.from(be); pl.bcode = Int32Array.from(code);
+  pl.bidx = new Int32Array(n).fill(-1);
+  const bv = [];
+  for (const v of be) if (pl.bidx[v] < 0) { pl.bidx[v] = bv.length; bv.push(v); }
+  pl.bvert = Uint32Array.from(bv);
+  const nb = bv.length;
+  pl.bgap = new Float64Array(nb); pl.bvn = new Float64Array(nb); pl.bvt = new Float64Array(nb);
+  pl.bcls = new Uint8Array(nb); pl.bn = new Float64Array(3 * nb); pl.bq = new Int16Array(nb);
+}
+function worldPositions(pl) {
+  const m = qmat(pl.q), p = pl.pos, w = pl.wpos;
+  for (let k = 0; k < pl.n; k++) {
+    const x = p[3 * k], y = p[3 * k + 1], z = p[3 * k + 2];
+    w[3 * k] = m[0] * x + m[1] * y + m[2] * z; w[3 * k + 1] = m[3] * x + m[4] * y + m[5] * z; w[3 * k + 2] = m[6] * x + m[7] * y + m[8] * z;
+  }
+}
+// add area dA of newly created sea floor to column k, combining by the mixing rule (§3)
+function addNewFloor(pl, k, dA) {
+  const A0 = pl.A[k], A1 = A0 + dA, V0 = pl.Vc[k], dV = P.hc_o * dA, V1 = V0 + dV, f0 = A0 / A1, f1 = dA / A1;
+  pl.rhoc[k] = (pl.rhoc[k] * V0 + P.rhoc_o * dV) / V1;
+  pl.rhom[k] = pl.rhom[k] * f0 + P.rhom_o * f1;
+  pl.L[k] = pl.L[k] * f0 + P.L0 * f1;
+  pl.e[k] = pl.e[k] * f0 + P.e_ref * f1;
+  pl.w[k] *= f0; pl.D[k] *= f0;
+  pl.T[3 * k] *= f0; pl.T[3 * k + 1] *= f0; pl.T[3 * k + 2] *= f0;
+  pl.A[k] = A1; pl.Vc[k] = V1;
 }
 
 // ---------- world initialisation ----------
@@ -352,160 +468,352 @@ function makeWorld(opts) {
   const S = buildSphere(opts.N, rng);
   buildTopology(S);
   const { N, nt, tris, triNb, off, nb, pts, area } = S;
-
-  // plates: partition triangles
   const nP = opts.nPlates;
-  const seeds = []; const used = new Set();
-  while (seeds.length < nP) { const t = (rng() * nt) | 0; if (!used.has(t)) { used.add(t); seeds.push(t); } }
-  const pw = seeds.map(() => Math.exp(0.9 * gauss(rng)));
-  const triPlate = growRegions(nt, (t, cb) => { for (let e = 0; e < 3; e++) { const n = triNb[3 * t + e]; if (n >= 0) cb(n); } }, seeds, pw, rng, nt);
+  const triPlate = partitionPlates(S, nP, rng);
 
-  // Euler poles: uniform axis, surface speed 1–9 cm/yr at the equator of the pole
   const plates = [];
   for (let p = 0; p < nP; p++) {
     const ax = new THREE.Vector3(gauss(rng), gauss(rng), gauss(rng)).normalize();
-    const v = (1 + 8 * rng()) * 0.01 / (365.25 * 86400); // m/s
-    plates.push({ id: p, axis: ax, omega: v / P.R, q: new THREE.Quaternion(), hue: (p * 0.618034) % 1 });
+    const v = (1 + 6 * rng()) * 0.01 / YR; // surface speed at the Euler equator, 1–7 cm/yr
+    plates.push(newPlate(p, ax, v / P.R, (p * 0.618034) % 1));
   }
 
-  // continents: grow on the vertex graph to the requested area fraction
-  const totalA = 4 * Math.PI * P.R * P.R;
+  // continents
   const isCont = new Uint8Array(N);
   if (opts.contFrac > 0) {
-    const nC = 2 + Math.floor(rng() * 5);
-    const cs = []; for (let i = 0; i < nC; i++) cs.push((rng() * N) | 0);
-    const cw = cs.map(() => Math.exp(0.7 * gauss(rng)));
-    const target = Math.round(opts.contFrac * N); // vertices have near-equal area
-    const own = growRegions(N, (v, cb) => { for (let j = off[v]; j < off[v + 1]; j++) cb(nb[j]); }, cs, cw, rng, target);
+    const nC = 2 + Math.floor(rng() * 5), cs = [], cw = [];
+    for (let i = 0; i < nC; i++) { cs.push((rng() * N) | 0); cw.push(Math.exp(0.7 * gauss(rng))); }
+    const own = growRegions(N, (v, cb) => { for (let j = off[v]; j < off[v + 1]; j++) cb(nb[j]); }, cs, cw, rng, Math.round(opts.contFrac * N));
     for (let i = 0; i < N; i++) isCont[i] = own[i] >= 0 ? 1 : 0;
   }
 
-  // divergent plate-boundary vertices → seafloor age sources
-  const vel = (p, x) => new THREE.Vector3().crossVectors(plates[p].axis, x).multiplyScalar(plates[p].omega * P.R);
-  const ridge = [];
-  const tmpA = new THREE.Vector3(), tmpB = new THREE.Vector3();
-  const centroid = (t, out) => out.set(0, 0, 0).add(new THREE.Vector3(pts[3 * tris[3 * t]], pts[3 * tris[3 * t] + 1], pts[3 * tris[3 * t] + 2]))
-    .add(new THREE.Vector3(pts[3 * tris[3 * t + 1]], pts[3 * tris[3 * t + 1] + 1], pts[3 * tris[3 * t + 1] + 2]))
-    .add(new THREE.Vector3(pts[3 * tris[3 * t + 2]], pts[3 * tris[3 * t + 2] + 1], pts[3 * tris[3 * t + 2] + 2])).divideScalar(3);
+  // initial sea-floor age: distance from boundaries the prescribed motions make divergent
+  const ridge = [], c = (t, i) => (pts[3 * tris[3 * t] + i] + pts[3 * tris[3 * t + 1] + i] + pts[3 * tris[3 * t + 2] + i]) / 3;
   for (let t = 0; t < nt; t++) for (let e = 0; e < 3; e++) {
-    const u = triNb[3 * t + e]; if (u < 0 || u < t) continue;
+    const u = triNb[3 * t + e]; if (u < t) continue;
     const p = triPlate[t], q = triPlate[u]; if (p === q) continue;
-    centroid(t, tmpA); centroid(u, tmpB);
-    const n = tmpB.clone().sub(tmpA).normalize();          // from p toward q
-    const m = tmpA.clone().add(tmpB).multiplyScalar(0.5).normalize();
-    const vn = vel(p, m).sub(vel(q, m)).dot(n);            // >0 converging
-    if (vn < -0.3 * 0.01 / (365.25 * 86400)) { ridge.push(tris[3 * t + e], tris[3 * t + (e + 1) % 3]); }
+    const A = new THREE.Vector3(c(t, 0), c(t, 1), c(t, 2)), B = new THREE.Vector3(c(u, 0), c(u, 1), c(u, 2));
+    const n = B.clone().sub(A).normalize(), m = A.clone().add(B).normalize();
+    const du = new THREE.Vector3().crossVectors(plates[p].axis, m).multiplyScalar(plates[p].omega)
+      .sub(new THREE.Vector3().crossVectors(plates[q].axis, m).multiplyScalar(plates[q].omega));
+    if (du.dot(n) * P.R < -0.3 * 0.01 / YR) ridge.push(tris[3 * t + e], tris[3 * t + (e + 1) % 3]);
   }
   const dRidge = ridge.length ? graphDistance(S, ridge) : new Float64Array(N).fill(3000e3);
-
-  // distance to coast inside continents
   const coast = []; for (let i = 0; i < N; i++) if (!isCont[i]) coast.push(i);
   const dCoast = coast.length ? graphDistance(S, coast) : new Float64Array(N).fill(2000e3);
   const nz = smoothNoise(S, rng, Math.max(4, Math.round(Math.sqrt(N) / 12)));
 
-  // per-vertex initial state (Table: Per-column state)
-  const g = { Vc: new Float64Array(N), rhoc: new Float64Array(N), rhom: new Float64Array(N), L: new Float64Array(N) };
-  const halfRate = 0.03 / (365.25 * 86400);
+  const g = { hc: new Float64Array(N), rhoc: new Float64Array(N), rhom: new Float64Array(N), L: new Float64Array(N) };
+  const halfRate = 0.03 / YR;
   for (let i = 0; i < N; i++) {
     if (isCont[i]) {
       const s = smoothstep(0, 700e3, dCoast[i]);
-      const hc = Math.max(12e3, 18e3 + 16e3 * s + 3.5e3 * nz[i]);
-      g.Vc[i] = hc * area[i]; g.rhoc[i] = P.rhoc_cont;
+      g.hc[i] = Math.max(12e3, 18e3 + 16e3 * s + 3.5e3 * nz[i]); g.rhoc[i] = P.rhoc_cont;
       g.rhom[i] = 3340 - 15 * s - 5 * Math.max(0, nz[i]);
       g.L[i] = Math.min(Lmax(g.rhom[i]), 90e3 + 80e3 * s + 15e3 * nz[i]);
     } else {
-      const age = dRidge[i] / halfRate * (0.85 + 0.15 * nz[i]);
-      g.Vc[i] = P.hc_o * area[i]; g.rhoc[i] = P.rhoc_o; g.rhom[i] = P.rhom_o;
-      g.L[i] = Math.min(P.Lmax_o, Math.max(P.L0, P.aL * Math.sqrt(P.kappa * Math.max(age, 0))));
+      const age = Math.max(0, dRidge[i] / halfRate * (0.85 + 0.15 * nz[i]));
+      g.hc[i] = P.hc_o; g.rhoc[i] = P.rhoc_o; g.rhom[i] = P.rhom_o;
+      g.L[i] = Math.min(P.Lmax_o, Math.max(P.L0, P.aL * Math.sqrt(P.kappa * age)));
     }
   }
 
-  // split into per-plate meshes; vertices on shared edges are duplicated (§2: each plate is its own mesh)
-  const local = new Int32Array(N);
+  // split into per-plate meshes; vertices on shared edges are duplicated (§2)
+  const local = new Int32Array(N), src = [];
   for (let p = 0; p < nP; p++) {
-    const pl = plates[p];
-    local.fill(-1);
-    const verts = [], tlist = [];
+    const pl = plates[p]; local.fill(-1); src.length = 0;
     for (let t = 0; t < nt; t++) if (triPlate[t] === p) {
-      for (let e = 0; e < 3; e++) { const v = tris[3 * t + e]; if (local[v] < 0) { local[v] = verts.length; verts.push(v); } tlist.push(local[v]); }
+      const ids = [0, 1, 2].map(e => { const v = tris[3 * t + e]; if (local[v] < 0) { local[v] = addVertex(pl, pts[3 * v], pts[3 * v + 1], pts[3 * v + 2]); src.push(v); } return local[v]; });
+      addTri(pl, ids[0], ids[1], ids[2]);
     }
-    const n = verts.length;
-    pl.n = n;
-    pl.pos = new Float32Array(3 * n);             // unit positions in the plate's body frame
-    pl.A = new Float64Array(n);
-    // state
-    pl.Vc = new Float64Array(n); pl.rhoc = new Float64Array(n); pl.rhom = new Float64Array(n); pl.L = new Float64Array(n);
-    pl.w = new Float32Array(n); pl.D = new Float32Array(n); pl.T = new Float32Array(3 * n); pl.sub = new Uint8Array(n);
-    pl.e = new Float64Array(n);
-    for (let k = 0; k < n; k++) {
-      const v = verts[k];
-      pl.pos[3 * k] = pts[3 * v]; pl.pos[3 * k + 1] = pts[3 * v + 1]; pl.pos[3 * k + 2] = pts[3 * v + 2];
-      // shared vertices: dual area from this plate's triangles only
-      pl.rhoc[k] = g.rhoc[v]; pl.rhom[k] = g.rhom[v]; pl.L[k] = g.L[v];
+    computeAreas(pl);
+    for (let k = 0; k < pl.n; k++) {
+      const v = src[k];
+      pl.rhoc[k] = g.rhoc[v]; pl.rhom[k] = g.rhom[v]; pl.L[k] = g.L[v]; pl.Vc[k] = g.hc[v] * pl.A[k];
+      pl.e[k] = isostaticElevation(0, g.hc[v], pl.rhoc[k], pl.rhom[k], pl.L[k], 30);
     }
-    pl.tri = new Uint32Array(tlist);
-    for (let t = 0; t < pl.tri.length; t += 3) {
-      const a = pl.tri[t], b = pl.tri[t + 1], c = pl.tri[t + 2];
-      const ar = triArea(pl.pos, a, b, c) * P.R * P.R;
-      pl.A[a] += ar / 3; pl.A[b] += ar / 3; pl.A[c] += ar / 3;
-    }
-    for (let k = 0; k < n; k++) { const v = verts[k]; pl.Vc[k] = (g.Vc[v] / area[v]) * pl.A[k]; } // keep h_c, not V_c, across the split
-    // boundary edges: edges used by exactly one triangle of this plate
-    const ec = new Map();
-    for (let t = 0; t < pl.tri.length; t += 3) for (let e = 0; e < 3; e++) {
-      const a = pl.tri[t + e], b = pl.tri[t + (e + 1) % 3];
-      const key = Math.min(a, b) * n + Math.max(a, b); ec.set(key, (ec.get(key) || 0) + 1);
-    }
-    const be = []; for (const [key, c] of ec) if (c === 1) be.push(Math.floor(key / n), key % n);
-    pl.bedges = new Uint32Array(be);
-    for (let k = 0; k < n; k++) pl.e[k] = isostaticElevation(0, pl.Vc[k] / pl.A[k], pl.rhoc[k], pl.rhom[k], pl.L[k], 30);
+    extractBoundary(pl);
   }
-  return { S, plates, time: 0, totalA };
+  // coverage probes: a fixed set of points in the world frame
+  const np = Math.min(8000, N), probes = new Float64Array(3 * np), ga = Math.PI * (3 - Math.sqrt(5));
+  for (let i = 0; i < np; i++) { const z = 1 - (2 * i + 1) / np, r = Math.sqrt(1 - z * z); probes[3 * i] = r * Math.cos(i * ga); probes[3 * i + 1] = r * Math.sin(i * ga); probes[3 * i + 2] = z; }
+  const W = { s: S.s, plates, time: 0, probes, coverage: { gap: 0, over: 0 }, blen: new Float64Array(5), events: 0 };
+  for (const pl of plates) worldPositions(pl);
+  contactGeometry(W);
+  return W;
 }
 function smoothstep(a, b, x) { const t = Math.min(Math.max((x - a) / (b - a), 0), 1); return t * t * (3 - 2 * t); }
-function triArea(pos, a, b, c) {
-  const ux = pos[3 * b] - pos[3 * a], uy = pos[3 * b + 1] - pos[3 * a + 1], uz = pos[3 * b + 2] - pos[3 * a + 2];
-  const wx = pos[3 * c] - pos[3 * a], wy = pos[3 * c + 1] - pos[3 * a + 1], wz = pos[3 * c + 2] - pos[3 * a + 2];
-  return 0.5 * Math.hypot(uy * wz - uz * wy, uz * wx - ux * wz, ux * wy - uy * wx);
+
+// ---------- spatial hash on the unit sphere (3-D grid, 27-cell queries) ----------
+class SphereHash {
+  constructor(cell) { this.inv = 1 / cell; this.map = new Map(); }
+  key(ix, iy, iz) { return ((ix + 512) * 1024 + (iy + 512)) * 1024 + (iz + 512); }
+  insert(x, y, z, id) { const k = this.key(Math.floor(x * this.inv), Math.floor(y * this.inv), Math.floor(z * this.inv)); const a = this.map.get(k); if (a) a.push(id); else this.map.set(k, [id]); }
+  query(x, y, z, cb) {
+    const ix = Math.floor(x * this.inv), iy = Math.floor(y * this.inv), iz = Math.floor(z * this.inv);
+    for (let dx = -1; dx <= 1; dx++) for (let dy = -1; dy <= 1; dy++) for (let dz = -1; dz <= 1; dz++) {
+      const a = this.map.get(this.key(ix + dx, iy + dy, iz + dz)); if (a) for (let i = 0; i < a.length; i++) cb(a[i]);
+    }
+  }
 }
 
-// ---------- §12 (state evolution), v0.1 subset ----------
+// ---------- §11.1 contact geometry ----------
+// For every boundary vertex: outward normal, signed gap to the nearest boundary of another plate
+// (negative when inside it), normal and tangential relative velocity, and the resulting class (§11.2).
+function contactGeometry(W) {
+  const s = W.s, plates = W.plates, hash = new SphereHash(NUM.cell * s);
+  // gather all boundary segments in world coordinates
+  let ns = 0; for (const pl of plates) ns += pl.bedge.length / 2;
+  const segP = new Int16Array(ns), segX = new Float64Array(6 * ns);
+  let j = 0;
+  for (const pl of plates) {
+    const w = pl.wpos, be = pl.bedge;
+    for (let i = 0; i < be.length; i += 2, j++) {
+      const a = be[i], b = be[i + 1];
+      segP[j] = pl.id;
+      for (let c = 0; c < 3; c++) { segX[6 * j + c] = w[3 * a + c]; segX[6 * j + 3 + c] = w[3 * b + c]; }
+      hash.insert((w[3 * a] + w[3 * b]) / 2, (w[3 * a + 1] + w[3 * b + 1]) / 2, (w[3 * a + 2] + w[3 * b + 2]) / 2, j);
+    }
+  }
+  W.blen.fill(0);
+  const triHash = triangleHash(W);
+  W.triHash = triHash;
+  const omegaVec = plates.map(pl => [pl.axis.x * pl.omega * P.R, pl.axis.y * pl.omega * P.R, pl.axis.z * pl.omega * P.R]);
+  for (const pl of plates) {
+    const w = pl.wpos, be = pl.bedge, bn = pl.bn, nb = pl.bvert.length;
+    bn.fill(0);
+    for (let i = 0; i < be.length; i += 2) { // edge outward normal ∝ (b−a)×(a+b)
+      const a = be[i], b = be[i + 1], ia = pl.bidx[a], ib = pl.bidx[b];
+      const tx = w[3 * b] - w[3 * a], ty = w[3 * b + 1] - w[3 * a + 1], tz = w[3 * b + 2] - w[3 * a + 2];
+      const mx = w[3 * b] + w[3 * a], my = w[3 * b + 1] + w[3 * a + 1], mz = w[3 * b + 2] + w[3 * a + 2];
+      const nx = ty * mz - tz * my, ny = tz * mx - tx * mz, nz = tx * my - ty * mx;
+      bn[3 * ia] += nx; bn[3 * ia + 1] += ny; bn[3 * ia + 2] += nz; bn[3 * ib] += nx; bn[3 * ib + 1] += ny; bn[3 * ib + 2] += nz;
+    }
+    const Wp = omegaVec[pl.id];
+    for (let i = 0; i < nb; i++) {
+      const v = pl.bvert[i], x = w[3 * v], y = w[3 * v + 1], z = w[3 * v + 2];
+      // project normal to the tangent plane and normalise
+      let nx = bn[3 * i], ny = bn[3 * i + 1], nz = bn[3 * i + 2]; const d = nx * x + ny * y + nz * z;
+      nx -= d * x; ny -= d * y; nz -= d * z; const nl = Math.hypot(nx, ny, nz) || 1; nx /= nl; ny /= nl; nz /= nl;
+      bn[3 * i] = nx; bn[3 * i + 1] = ny; bn[3 * i + 2] = nz;
+      // inside/outside from a point-in-plate test against every other plate; |gap| from the nearest
+      // boundary segment of the containing plate (if inside) or of any other plate (if outside)
+      let host = -1;
+      platesContaining(W, triHash, x, y, z, pl.id, p => { if (host < 0) host = p; });
+      let best = Infinity, bj = -1, bt = 0;
+      hash.query(x, y, z, j => {
+        const sp = segP[j];
+        if (sp === pl.id || (host >= 0 && sp !== host)) return;
+        const o = 6 * j, ax = segX[o], ay = segX[o + 1], az = segX[o + 2];
+        const ux = segX[o + 3] - ax, uy = segX[o + 4] - ay, uz = segX[o + 5] - az;
+        const uu = ux * ux + uy * uy + uz * uz;
+        let t = uu > 0 ? ((x - ax) * ux + (y - ay) * uy + (z - az) * uz) / uu : 0; t = t < 0 ? 0 : t > 1 ? 1 : t;
+        const dx = ax + t * ux - x, dy = ay + t * uy - y, dz = az + t * uz - z, d2 = dx * dx + dy * dy + dz * dz;
+        if (d2 < best) { best = d2; bj = j; bt = t; }
+      });
+      let cls, g = Infinity, vn = 0, vt = 0, q = host;
+      if (bj < 0) cls = host >= 0 ? CLS.OVER : CLS.GAP, g = host >= 0 ? -Infinity : Infinity;
+      else {
+        q = segP[bj];
+        const inside = host >= 0;
+        g = Math.sqrt(best) * (inside ? -1 : 1);
+        const o = 6 * bj, px = segX[o] + bt * (segX[o + 3] - segX[o]), py = segX[o + 1] + bt * (segX[o + 4] - segX[o + 1]), pz = segX[o + 2] + bt * (segX[o + 5] - segX[o + 2]);
+        const Wq = omegaVec[q];
+        const dux = (Wp[1] * z - Wp[2] * y) - (Wq[1] * pz - Wq[2] * py);
+        const duy = (Wp[2] * x - Wp[0] * z) - (Wq[2] * px - Wq[0] * pz);
+        const duz = (Wp[0] * y - Wp[1] * x) - (Wq[0] * py - Wq[1] * px);
+        vn = dux * nx + duy * ny + duz * nz;                                   // >0: converging
+        vt = dux * (y * nz - z * ny) + duy * (z * nx - x * nz) + duz * (x * ny - y * nx);
+        if (g > NUM.gtol * s) cls = CLS.GAP;
+        else if (g < -NUM.gtol * s) cls = CLS.OVER;
+        else if (Math.abs(vt) > Math.abs(vn)) cls = CLS.TRANS;
+        else cls = vn > 0 ? CLS.CONV : CLS.DIV;
+      }
+      pl.bgap[i] = g; pl.bvn[i] = vn; pl.bvt[i] = vt; pl.bcls[i] = cls; pl.bq[i] = q;
+    }
+    for (let i = 0; i < be.length; i += 2) {
+      const a = be[i], b = be[i + 1];
+      W.blen[pl.bcls[pl.bidx[a]]] += 0.5 * P.R * Math.hypot(w[3 * b] - w[3 * a], w[3 * b + 1] - w[3 * a + 1], w[3 * b + 2] - w[3 * a + 2]);
+    }
+  }
+}
+
+// ---------- §11.3 spreading: extend each plate by a strip of new columns toward the gap midline ----------
+function spread(W, pl) {
+  const s = W.s, nb = pl.bvert.length, w = pl.wpos, m = qmat(pl.q);
+  const cand = new Uint8Array(nb), tb = new Float64Array(3 * nb);
+  let any = false;
+  for (let i = 0; i < nb; i++) {
+    if (pl.bcls[i] !== CLS.GAP || !(pl.bgap[i] > NUM.dxacc * s)) continue;
+    const v = pl.bvert[i], d = Math.min(pl.bgap[i] / 2, NUM.reach * s);
+    let x = w[3 * v] + pl.bn[3 * i] * d, y = w[3 * v + 1] + pl.bn[3 * i + 1] * d, z = w[3 * v + 2] + pl.bn[3 * i + 2] * d;
+    const l = Math.hypot(x, y, z); x /= l; y /= l; z /= l;
+    let covered = false; platesContaining(W, W.triHash, x, y, z, -1, () => { covered = true; });
+    if (covered) continue;
+    tb[3 * i] = m[0] * x + m[3] * y + m[6] * z; tb[3 * i + 1] = m[1] * x + m[4] * y + m[7] * z; tb[3 * i + 2] = m[2] * x + m[5] * y + m[8] * z; // body frame (Mᵀ)
+    cand[i] = 1; any = true;
+  }
+  if (!any) return false;
+  // merge midline points that would be too close (concave stretches)
+  const parent = new Int32Array(nb); for (let i = 0; i < nb; i++) parent[i] = i;
+  const find = i => { while (parent[i] !== i) { parent[i] = parent[parent[i]]; i = parent[i]; } return i; };
+  const be = pl.bedge;
+  for (let k = 0; k < be.length; k += 2) {
+    const ia = pl.bidx[be[k]], ib = pl.bidx[be[k + 1]];
+    if (cand[ia] && cand[ib] && Math.hypot(tb[3 * ia] - tb[3 * ib], tb[3 * ia + 1] - tb[3 * ib + 1], tb[3 * ia + 2] - tb[3 * ib + 2]) < NUM.merge * s) {
+      const ra = find(ia), rb = find(ib); if (ra !== rb) parent[ra] = rb;
+    }
+  }
+  const acc = new Float64Array(3 * nb);
+  for (let i = 0; i < nb; i++) if (cand[i]) { const r = find(i); acc[3 * r] += tb[3 * i]; acc[3 * r + 1] += tb[3 * i + 1]; acc[3 * r + 2] += tb[3 * i + 2]; }
+  for (let i = 0; i < nb; i++) if (cand[i] && find(i) === i) { const l = Math.hypot(acc[3 * i], acc[3 * i + 1], acc[3 * i + 2]); acc[3 * i] /= l; acc[3 * i + 1] /= l; acc[3 * i + 2] /= l; }
+  // candidate triangles across each boundary edge a→b (new triangles have b→a, so they lie outside)
+  const P3 = new Float64Array(9), cands = [];
+  const put = (o, id) => { if (id >= 0) { P3[o] = pl.pos[3 * id]; P3[o + 1] = pl.pos[3 * id + 1]; P3[o + 2] = pl.pos[3 * id + 2]; } else { const r = -id - 1; P3[o] = acc[3 * r]; P3[o + 1] = acc[3 * r + 1]; P3[o + 2] = acc[3 * r + 2]; } };
+  const minArea = 0.04 * s * s;
+  const tryTri = (a, b, c) => { put(0, a); put(3, b); put(6, c); if (orient(P3, 0, 1, 2) > minArea) cands.push(a, b, c); };
+  for (let k = 0; k < be.length; k += 2) {
+    const a = be[k], b = be[k + 1], ia = pl.bidx[a], ib = pl.bidx[b];
+    const ma = cand[ia] ? -find(ia) - 1 : 0, mb = cand[ib] ? -find(ib) - 1 : 0;
+    if (ma && mb) { tryTri(b, a, ma); if (ma !== mb) tryTri(b, ma, mb); }
+    else if (ma) tryTri(b, a, ma);
+    else if (mb) tryTri(b, a, mb);
+  }
+  if (!cands.length) return false;
+  // materialise virtual vertices, add triangles, and credit their area as new sea floor
+  const made = new Map(), R2 = P.R * P.R;
+  const real = id => { if (id >= 0) return id; let k = made.get(id); if (k === undefined) { const r = -id - 1; k = addVertex(pl, acc[3 * r], acc[3 * r + 1], acc[3 * r + 2]); made.set(id, k); } return k; };
+  for (let k = 0; k < cands.length; k += 3) {
+    const a = real(cands[k]), b = real(cands[k + 1]), c = real(cands[k + 2]);
+    addTri(pl, a, b, c);
+    const dA = triArea(pl.pos, a, b, c) * R2 / 3;
+    addNewFloor(pl, a, dA); addNewFloor(pl, b, dA); addNewFloor(pl, c, dA);
+  }
+  for (const k of made.values()) pl.e[k] = isostaticElevation(P.e_ref, pl.Vc[k] / pl.A[k], pl.rhoc[k], pl.rhom[k], pl.L[k], 20);
+  W.events += made.size;
+  extractBoundary(pl);
+  splitLongEdges(W, pl);
+  pl.version++;
+  return true;
+}
+
+// split boundary edges longer than ℓ_max; remeshing preserves h_c (not yet strictly conservative)
+function splitLongEdges(W, pl) {
+  const lim = NUM.lmax * W.s;
+  for (let pass = 0; pass < 3; pass++) {
+    const hc = new Float64Array(pl.n + pl.bedge.length);
+    for (let k = 0; k < pl.n; k++) hc[k] = pl.Vc[k] / pl.A[k];
+    const used = new Uint8Array(pl.nt);
+    let count = 0;
+    for (let j = 0; j < pl.bcode.length; j++) {
+      const code = pl.bcode[j], t = (code / 3) | 0, e = code % 3;
+      if (used[t]) continue;
+      const a = pl.tri[3 * t + e], b = pl.tri[3 * t + (e + 1) % 3], c = pl.tri[3 * t + (e + 2) % 3];
+      const pa = 3 * a, pb = 3 * b;
+      if (Math.hypot(pl.pos[pb] - pl.pos[pa], pl.pos[pb + 1] - pl.pos[pa + 1], pl.pos[pb + 2] - pl.pos[pa + 2]) <= lim) continue;
+      let x = pl.pos[pa] + pl.pos[pb], y = pl.pos[pa + 1] + pl.pos[pb + 1], z = pl.pos[pa + 2] + pl.pos[pb + 2]; const l = Math.hypot(x, y, z);
+      const mv = addVertex(pl, x / l, y / l, z / l);
+      for (const f of ["rhoc", "rhom", "L", "e", "w", "D"]) pl[f][mv] = 0.5 * (pl[f][a] + pl[f][b]);
+      hc[mv] = 0.5 * (hc[a] + hc[b]);
+      pl.tri[3 * t + (e + 1) % 3] = mv;      // (a, b, c) → (a, m, c) + (m, b, c)
+      addTri(pl, mv, b, c);
+      used[t] = 1; count++;
+    }
+    if (!count) return;
+    computeAreas(pl);
+    for (let k = 0; k < pl.n; k++) pl.Vc[k] = hc[k] * pl.A[k];
+    extractBoundary(pl);
+  }
+}
+
+// ---------- point-in-plate queries (world frame) ----------
+// Each triangle is binned into every grid cell its bounding box touches; cells are hashed into a flat
+// bucket array (counting sort, no per-cell allocations). A query reads one bucket; collisions only add
+// candidates, which the exact containment test rejects.
+const TRI_ID = 4194304;
+function triangleHash(W) {
+  const inv = 1 / (2 * W.s), plates = W.plates;
+  let ntot = 0; for (const pl of plates) ntot += pl.nt;
+  const M = 1 << Math.ceil(Math.log2(Math.max(1024, 4 * ntot)));
+  const mask = M - 1, count = new Int32Array(M + 1);
+  const cellOf = (i, j, k) => (Math.imul(i, 73856093) ^ Math.imul(j, 19349663) ^ Math.imul(k, 83492791)) & mask;
+  const visit = cb => {
+    for (const pl of plates) {
+      const w = pl.wpos, tri = pl.tri;
+      for (let t = 0; t < pl.nt; t++) {
+        const a = 3 * tri[3 * t], b = 3 * tri[3 * t + 1], c = 3 * tri[3 * t + 2];
+        const i0 = Math.floor(Math.min(w[a], w[b], w[c]) * inv), i1 = Math.floor(Math.max(w[a], w[b], w[c]) * inv);
+        const j0 = Math.floor(Math.min(w[a + 1], w[b + 1], w[c + 1]) * inv), j1 = Math.floor(Math.max(w[a + 1], w[b + 1], w[c + 1]) * inv);
+        const k0 = Math.floor(Math.min(w[a + 2], w[b + 2], w[c + 2]) * inv), k1 = Math.floor(Math.max(w[a + 2], w[b + 2], w[c + 2]) * inv);
+        const id = pl.id * TRI_ID + t;
+        for (let i = i0; i <= i1; i++) for (let j = j0; j <= j1; j++) for (let k = k0; k <= k1; k++) cb(cellOf(i, j, k), id);
+      }
+    }
+  };
+  visit(h => { count[h + 1]++; });
+  for (let h = 0; h < M; h++) count[h + 1] += count[h];
+  const items = new Int32Array(count[M]), fill = count.slice(0, M);
+  visit((h, id) => { items[fill[h]++] = id; });
+  return { queryCell(x, y, z, cb) { const h = cellOf(Math.floor(x * inv), Math.floor(y * inv), Math.floor(z * inv)); for (let q = count[h], e = count[h + 1]; q < e; q++) cb(items[q]); } };
+}
+// calls cb(plateId) for every plate (other than `skip`) with a triangle containing x
+function platesContaining(W, hash, x, y, z, skip, cb) {
+  hash.queryCell(x, y, z, id => {
+    const p = Math.floor(id / TRI_ID); if (p === skip) return;
+    const t = id - p * TRI_ID, pl = W.plates[p], w = pl.wpos, a = 3 * pl.tri[3 * t], b = 3 * pl.tri[3 * t + 1], c = 3 * pl.tri[3 * t + 2];
+    const sd = (u, v) => x * (w[u + 1] * w[v + 2] - w[u + 2] * w[v + 1]) + y * (w[u + 2] * w[v] - w[u] * w[v + 2]) + z * (w[u] * w[v + 1] - w[u + 1] * w[v]);
+    if (sd(a, b) >= 0 && sd(b, c) >= 0 && sd(c, a) >= 0) cb(p);
+  });
+}
+
+// ---------- §11.8 coverage: fraction of probe points covered by no plate / by more than one ----------
+function measureCoverage(W) {
+  const hash = triangleHash(W), pr = W.probes, np = pr.length / 3, seen = new Int32Array(W.plates.length);
+  let gap = 0, over = 0;
+  for (let i = 0; i < np; i++) {
+    let cnt = 0;
+    platesContaining(W, hash, pr[3 * i], pr[3 * i + 1], pr[3 * i + 2], -1, p => { if (seen[p] !== i + 1) { seen[p] = i + 1; cnt++; } });
+    if (cnt === 0) gap++; else if (cnt > 1) over++;
+  }
+  W.coverage.gap = gap / np; W.coverage.over = over / np;
+}
+
+// ---------- time step (§14), M1 subset ----------
 function step(W, dtMyr) {
-  const dt = dtMyr * MYR;
-  const dq = new THREE.Quaternion();
+  // boundary events first, using the contact geometry of the current (unchanged) positions
+  for (const pl of W.plates) spread(W, pl);
+  const dt = dtMyr * MYR, dq = new THREE.Quaternion(), a2k = P.aL * P.aL * P.kappa * dt;
   for (const pl of W.plates) {
-    dq.setFromAxisAngle(pl.axis, pl.omega * dt);
-    pl.q.premultiply(dq);
-    const a2k = P.aL * P.aL * P.kappa * dt;
+    dq.setFromAxisAngle(pl.axis, pl.omega * dt); pl.q.premultiply(dq);
     for (let k = 0; k < pl.n; k++) {
-      const Lm = Lmax(pl.rhom[k]);
-      let L = pl.L[k];
-      if (L < Lm) L = Math.min(Lm, Math.sqrt(L * L + a2k));     // exact integral of dL/dt = a_L²κ/(2L)
-      else L = Lm + (L - Lm) * Math.exp(-dt / P.tauL);          // relaxation of over-thickened plate
+      const Lm = Lmax(pl.rhom[k]); let L = pl.L[k];
+      if (L < Lm) L = Math.min(Lm, Math.sqrt(L * L + a2k));   // exact integral of dL/dt = a_L²κ/(2L)
+      else L = Lm + (L - Lm) * Math.exp(-dt / P.tauL);        // relaxation of over-thickened plate
       pl.L[k] = L;
       pl.e[k] = isostaticElevation(pl.e[k], pl.Vc[k] / pl.A[k], pl.rhoc[k], pl.rhom[k], L, 3);
     }
+    worldPositions(pl);
   }
+  contactGeometry(W);
   W.time += dtMyr;
 }
 
 // ---------- colour maps ----------
-function ramp(stops) { // stops: [[x, hex], ...]
+function ramp(stops) {
   const s = stops.map(([x, h]) => [x, ((h >> 16) & 255) / 255, ((h >> 8) & 255) / 255, (h & 255) / 255]);
   return function (x, out, o) {
     let i = 0; while (i < s.length - 2 && x > s[i + 1][0]) i++;
-    const a = s[i], b = s[i + 1];
-    const t = Math.min(Math.max((x - a[0]) / (b[0] - a[0]), 0), 1);
+    const a = s[i], b = s[i + 1], t = Math.min(Math.max((x - a[0]) / (b[0] - a[0]), 0), 1);
     out[o] = a[1] + (b[1] - a[1]) * t; out[o + 1] = a[2] + (b[2] - a[2]) * t; out[o + 2] = a[3] + (b[3] - a[3]) * t;
   };
 }
 const MAPS = {
   elev: { f: ramp([[-7000, 0x081a33], [-5000, 0x0f2c55], [-3500, 0x1a4878], [-2000, 0x2a6a9c], [-600, 0x4b93bb], [-1, 0x86c7d3], [0, 0x5f8c4c], [400, 0x86a35a], [1200, 0xb6a66c], [2200, 0x99785a], [3500, 0x7a6a62], [5000, 0xf1eee8]]),
-          lo: -7000, hi: 5000, ticks: ["−7 km", "0", "+5 km"], tickPos: [0, 7 / 12, 1] },
-  L:    { f: ramp([[0, 0xfde7a5], [30e3, 0xf3a65a], [70e3, 0xc1527a], [120e3, 0x6a2c91], [230e3, 0x1b1446]]), lo: 0, hi: 230e3, ticks: ["0", "115", "230 km"], tickPos: [0, .5, 1] },
-  hc:   { f: ramp([[0, 0x1b2a4a], [8e3, 0x2f5f8a], [20e3, 0x89a86a], [35e3, 0xd9b36a], [60e3, 0xf6efe0]]), lo: 0, hi: 60e3, ticks: ["0", "30", "60 km"], tickPos: [0, .5, 1] },
+          lo: -7000, hi: 5000, ticks: ["−7 km", "0", "+5 km"] },
+  L:    { f: ramp([[0, 0xfde7a5], [30e3, 0xf3a65a], [70e3, 0xc1527a], [120e3, 0x6a2c91], [230e3, 0x1b1446]]), lo: 0, hi: 230e3, ticks: ["0", "115", "230 km"] },
+  hc:   { f: ramp([[0, 0x1b2a4a], [8e3, 0x2f5f8a], [20e3, 0x89a86a], [35e3, 0xd9b36a], [60e3, 0xf6efe0]]), lo: 0, hi: 60e3, ticks: ["0", "30", "60 km"] },
 };
-function hsl(h, s, l, out, o) { const c = new THREE.Color().setHSL(h, s, l); out[o] = c.r; out[o + 1] = c.g; out[o + 2] = c.b; }
+const CLS_RGB = CLS_COLOR.map(h => [((h >> 16) & 255) / 255, ((h >> 8) & 255) / 255, (h & 255) / 255]);
 
 // ---------- rendering ----------
 const canvas = document.getElementById("view");
@@ -523,18 +831,13 @@ scene.add(new THREE.AmbientLight(0xffffff, 0.38));
 const sun = new THREE.DirectionalLight(0xffffff, 0.85); sun.position.set(-2, 1.5, 3); camera.add(sun);
 const world = new THREE.Group(); scene.add(world);
 world.quaternion.setFromEuler(new THREE.Euler(0.35, -0.6, 0));
-
-const mantleMat = new THREE.MeshPhongMaterial({ color: 0x3a1206, emissive: 0xc2501a, emissiveIntensity: 0.55, shininess: 4 });
-const mantle = new THREE.Mesh(new THREE.SphereGeometry(1, 96, 64), mantleMat);
+const mantle = new THREE.Mesh(new THREE.SphereGeometry(1, 96, 64), new THREE.MeshPhongMaterial({ color: 0x3a1206, emissive: 0xc2501a, emissiveIntensity: 0.55, shininess: 4 }));
 world.add(mantle);
-
-// faint atmosphere rim
-const rim = new THREE.Mesh(new THREE.SphereGeometry(1.06, 64, 48), new THREE.ShaderMaterial({
+scene.add(new THREE.Mesh(new THREE.SphereGeometry(1.06, 64, 48), new THREE.ShaderMaterial({
   transparent: true, side: THREE.BackSide, depthWrite: false,
   vertexShader: "varying vec3 vN; void main(){ vN = normalize(normalMatrix*normal); gl_Position = projectionMatrix*modelViewMatrix*vec4(position,1.); }",
   fragmentShader: "varying vec3 vN; void main(){ float k = pow(max(0., -vN.z + 0.25), 2.5); gl_FragColor = vec4(0.35,0.6,0.95, 0.55*k); }",
-}));
-scene.add(rim);
+})));
 
 const ui = {
   dt: document.getElementById("dt"), exag: document.getElementById("exag"), nv: document.getElementById("nv"),
@@ -548,64 +851,71 @@ const exagVal = () => +ui.exag.value;
 let W = null, running = true;
 const plateObjs = [];
 
+function disposeObj(o) { world.remove(o.group); o.mesh.geometry.dispose(); o.mesh.material.dispose(); o.lines.geometry.dispose(); o.lines.material.dispose(); }
+function buildPlateObject(pl, i) {
+  const geom = new THREE.BufferGeometry();
+  geom.setAttribute("position", new THREE.BufferAttribute(new Float32Array(3 * pl.n), 3));
+  geom.setAttribute("color", new THREE.BufferAttribute(new Float32Array(3 * pl.n), 3));
+  geom.setIndex(new THREE.BufferAttribute(pl.tri.slice(0, 3 * pl.nt), 1));
+  const mesh = new THREE.Mesh(geom, new THREE.MeshLambertMaterial({ vertexColors: true, polygonOffset: true, polygonOffsetFactor: -0.2 * i, polygonOffsetUnits: -i }));
+  const lg = new THREE.BufferGeometry();
+  lg.setAttribute("position", new THREE.BufferAttribute(new Float32Array(3 * pl.bedge.length), 3));
+  lg.setAttribute("color", new THREE.BufferAttribute(new Float32Array(3 * pl.bedge.length), 3));
+  const lines = new THREE.LineSegments(lg, new THREE.LineBasicMaterial({ vertexColors: true, transparent: true, opacity: 0.9 }));
+  const group = new THREE.Group(); group.add(mesh); group.add(lines); world.add(group);
+  return { group, mesh, lines, version: pl.version };
+}
 function buildPlateObjects() {
-  for (const o of plateObjs) { world.remove(o.group); o.mesh.geometry.dispose(); o.mesh.material.dispose(); o.lines.geometry.dispose(); o.lines.material.dispose(); }
+  for (const o of plateObjs) disposeObj(o);
   plateObjs.length = 0;
-  W.plates.forEach((pl, i) => {
-    const geom = new THREE.BufferGeometry();
-    geom.setAttribute("position", new THREE.BufferAttribute(new Float32Array(3 * pl.n), 3));
-    geom.setAttribute("color", new THREE.BufferAttribute(new Float32Array(3 * pl.n), 3));
-    geom.setIndex(new THREE.BufferAttribute(pl.tri, 1));
-    const mat = new THREE.MeshLambertMaterial({ vertexColors: true, polygonOffset: true, polygonOffsetFactor: -0.2 * i, polygonOffsetUnits: -i });
-    const mesh = new THREE.Mesh(geom, mat);
-    const lg = new THREE.BufferGeometry();
-    lg.setAttribute("position", new THREE.BufferAttribute(new Float32Array(3 * pl.bedges.length), 3));
-    const lines = new THREE.LineSegments(lg, new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.45 }));
-    const group = new THREE.Group(); group.add(mesh); group.add(lines);
-    world.add(group);
-    plateObjs.push({ group, mesh, lines });
-  });
+  W.plates.forEach((pl, i) => plateObjs.push(buildPlateObject(pl, i)));
   refreshGeometry();
 }
 
 function refreshGeometry() {
-  const k = exagVal() / P.R, mode = ui.mode.value;
+  const k = exagVal() / P.R, mode = ui.mode.value, col3 = [0, 0, 0];
   mantle.scale.setScalar(1 + k * -6800);
   W.plates.forEach((pl, i) => {
+    if (plateObjs[i].version !== pl.version) { disposeObj(plateObjs[i]); plateObjs[i] = buildPlateObject(pl, i); }
     const o = plateObjs[i];
     o.group.quaternion.copy(pl.q);
-    const pa = o.mesh.geometry.attributes.position, ca = o.mesh.geometry.attributes.color;
-    const pos = pa.array, col = ca.array;
+    const pa = o.mesh.geometry.attributes.position, ca = o.mesh.geometry.attributes.color, pos = pa.array, col = ca.array;
     for (let v = 0; v < pl.n; v++) {
       const r = 1 + k * pl.e[v];
       pos[3 * v] = pl.pos[3 * v] * r; pos[3 * v + 1] = pl.pos[3 * v + 1] * r; pos[3 * v + 2] = pl.pos[3 * v + 2] * r;
       if (mode === "elev") MAPS.elev.f(pl.e[v], col, 3 * v);
       else if (mode === "L") MAPS.L.f(pl.L[v], col, 3 * v);
       else if (mode === "hc") MAPS.hc.f(pl.Vc[v] / pl.A[v], col, 3 * v);
-      else { const hc = pl.Vc[v] / pl.A[v]; hsl(pl.hue, 0.55, hc > 15e3 ? 0.62 : 0.38, col, 3 * v); }
+      else { const c = new THREE.Color().setHSL(pl.hue, 0.45, pl.Vc[v] / pl.A[v] > 15e3 ? 0.66 : 0.42); col[3 * v] = c.r; col[3 * v + 1] = c.g; col[3 * v + 2] = c.b; }
     }
     pa.needsUpdate = true; ca.needsUpdate = true;
-    o.mesh.geometry.computeVertexNormals();
-    o.mesh.geometry.computeBoundingSphere();
+    o.mesh.geometry.computeVertexNormals(); o.mesh.geometry.computeBoundingSphere();
     o.lines.visible = ui.bounds.checked;
     if (o.lines.visible) {
-      const la = o.lines.geometry.attributes.position, lp = la.array, be = pl.bedges;
+      const la = o.lines.geometry.attributes.position, lc = o.lines.geometry.attributes.color, lp = la.array, lcol = lc.array, be = pl.bedge;
       for (let j = 0; j < be.length; j++) {
-        const v = be[j], r = 1 + k * Math.max(pl.e[v], 0) + 0.0015;
+        const v = be[j], r = 1 + k * Math.max(pl.e[v], 0) + 0.002, c = CLS_RGB[pl.bcls[pl.bidx[v]]];
         lp[3 * j] = pl.pos[3 * v] * r; lp[3 * j + 1] = pl.pos[3 * v + 1] * r; lp[3 * j + 2] = pl.pos[3 * v + 2] * r;
+        lcol[3 * j] = c[0]; lcol[3 * j + 1] = c[1]; lcol[3 * j + 2] = c[2];
       }
-      la.needsUpdate = true; o.lines.geometry.computeBoundingSphere();
+      la.needsUpdate = true; lc.needsUpdate = true; o.lines.geometry.computeBoundingSphere();
     }
   });
 }
 
 function updateReadout() {
+  measureCoverage(W);
   document.getElementById("r-time").textContent = W.time.toFixed(1) + " Myr";
   document.getElementById("r-plates").textContent = W.plates.length;
   let n = 0, land = 0, tot = 0;
   for (const pl of W.plates) { n += pl.n; for (let v = 0; v < pl.n; v++) { tot += pl.A[v]; if (pl.e[v] > 0) land += pl.A[v]; } }
   document.getElementById("r-cols").textContent = n.toLocaleString();
   document.getElementById("r-land").textContent = (100 * land / tot).toFixed(1) + " %";
+  document.getElementById("r-gap").textContent = (100 * W.coverage.gap).toFixed(1) + " %";
+  document.getElementById("r-over").textContent = (100 * W.coverage.over).toFixed(1) + " %";
+  const tl = W.blen.reduce((a, b) => a + b, 0) || 1;
+  document.querySelectorAll("#mix i").forEach((el, c) => { el.style.flexGrow = W.blen[c] / tl; });
+  document.querySelectorAll("#mix-key b").forEach((el, c) => { el.textContent = Math.round(100 * W.blen[c] / tl) + "%"; });
 }
 
 function drawLegend() {
@@ -620,8 +930,7 @@ function drawLegend() {
 function reset() {
   const t0 = performance.now();
   W = makeWorld({ N: nvVal(), contFrac: ui.cf.value / 100, nPlates: +ui.np.value, seed: +ui.seed.value || 0 });
-  buildPlateObjects();
-  updateReadout();
+  buildPlateObjects(); updateReadout();
   console.log(`world built in ${(performance.now() - t0).toFixed(0)} ms`);
 }
 
@@ -633,13 +942,10 @@ canvas.addEventListener("pointermove", e => {
   const p = pointers.get(e.pointerId); if (!p) return;
   const dx = e.clientX - p.x, dy = e.clientY - p.y; p.x = e.clientX; p.y = e.clientY;
   if (pointers.size === 1) {
-    const s = 2.2 * (camDist - 1) / camDist / canvas.clientHeight; // slower when close to the surface
-    const q = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), dx * s)
-      .multiply(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), dy * s));
+    const s = 2.2 * (camDist - 1) / camDist / canvas.clientHeight;
+    const q = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), dx * s).multiply(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), dy * s));
     world.quaternion.premultiply(q);
-  } else if (pointers.size === 2 && pinchStart > 0) {
-    setDist(pinchDist0 * pinchStart / pdist());
-  }
+  } else if (pointers.size === 2 && pinchStart > 0) setDist(pinchDist0 * pinchStart / pdist());
 });
 const endPtr = e => { pointers.delete(e.pointerId); if (pointers.size < 2) pinchStart = 0; if (!pointers.size) canvas.classList.remove("dragging"); };
 canvas.addEventListener("pointerup", endPtr); canvas.addEventListener("pointercancel", endPtr);
@@ -666,13 +972,14 @@ playBtn.addEventListener("click", () => { running = !running; playBtn.textConten
 document.getElementById("reset").addEventListener("click", reset);
 document.getElementById("dice").addEventListener("click", () => { ui.seed.value = Math.floor(Math.random() * 1e6); reset(); });
 const coll = document.getElementById("collapse");
-coll.addEventListener("click", () => { const p = document.getElementById("panel"); const c = p.classList.toggle("collapsed"); coll.textContent = c ? "show" : "hide"; coll.setAttribute("aria-expanded", String(!c)); resize(); });
+coll.addEventListener("click", () => { const c = document.getElementById("panel").classList.toggle("collapsed"); coll.textContent = c ? "show" : "hide"; coll.setAttribute("aria-expanded", String(!c)); resize(); });
+document.getElementById("mix-key").innerHTML = CLS_NAME.map((n, c) => `<span><i style="background:#${CLS_COLOR[c].toString(16).padStart(6, "0")}"></i>${n} <b>–</b></span>`).join("");
+document.getElementById("mix").innerHTML = CLS_COLOR.map(c => `<i style="background:#${c.toString(16).padStart(6, "0")}"></i>`).join("");
 if (window.innerWidth < 560) coll.click();
 
 function resize() {
   const w = canvas.clientWidth, h = canvas.clientHeight;
   renderer.setSize(w, h, false); camera.aspect = w / h;
-  // on wide screens, shift the globe right so the panel does not cover it
   const panel = document.getElementById("panel");
   const shift = (w > 760 && !panel.classList.contains("collapsed")) ? (panel.offsetWidth + 16) / 2 : 0;
   if (shift) camera.setViewOffset(w, h, -shift, 0, w, h); else camera.clearViewOffset();
@@ -687,11 +994,11 @@ function loop() {
   if (running && W) {
     step(W, dtVal());
     refreshGeometry();
-    if (++frame % 10 === 0) updateReadout();
+    if (++frame % 15 === 0) updateReadout();
   }
   renderer.render(scene, camera);
 }
 
 syncLabels(); drawLegend(); resize(); reset(); loop();
-window.__pp = { get W() { return W; }, step: n => { for (let i = 0; i < n; i++) step(W, dtVal()); refreshGeometry(); updateReadout(); } };
+window.__pp = { get W() { return W; }, step: n => { for (let i = 0; i < n; i++) step(W, dtVal()); refreshGeometry(); updateReadout(); }, measureCoverage };
 </script>
